@@ -61,6 +61,7 @@ MOUSEGESTURE_CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)" make app
 - `CGEventTap` 拦截右键按下、拖动和释放事件
 - 以位移长度判断点击/手势，以主轴判断四个方向；每次右键按下最多执行一个动作
 - `CGEvent` 发送键盘快捷键
+- 复制/粘贴锁定右键按下时的前台焦点窗口，发送前核对焦点；需要恢复焦点时最多等待约 600 毫秒，失败则取消，不向其他应用回退发送。请先激活要操作的编辑窗口并选中文字或放好插入点，再执行手势。
 - Accessibility API 记录并激活最近窗口，包括台前调度中的窗口
 - ScreenCaptureKit 创建跨台前调度组可见的实时置顶窗口镜像
 - `NSWorkspace` 启动 App

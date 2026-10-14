@@ -11,6 +11,7 @@ private let appLogger = Logger(subsystem: "com.yaoyinliang.MouseGesture", catego
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let store = SettingsStore()
     private let executor = ActionExecutor()
+    var settingsContent: SettingsView { SettingsView(store: store) }
     private var statusItem: NSStatusItem?
     private var settingsWindow: NSWindow?
     private var enabledItem: NSMenuItem?
@@ -18,14 +19,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var screenRecordingItem: NSMenuItem?
     private var launchAtLoginItem: NSMenuItem?
     private var cancellable: AnyCancellable?
+    private var appActivationObserver: NSObjectProtocol?
 
-    private lazy var engine = GestureEngine { [weak self] direction, location in
+    private lazy var engine = GestureEngine(captureShortcutTarget: { [weak self] in
+        // GestureEngine's event source is installed on CFRunLoopGetMain().
+        MainActor.assumeIsolated {
+            guard let self else { return Task { nil } }
+            return self.executor.captureShortcutTarget()
+        }
+    }) { [weak self] direction, location, target in
         guard let self else { return }
         let action = self.store.action(for: direction)
-        self.executor.execute(action, gestureLocation: location)
+        self.executor.execute(action, gestureLocation: location, shortcutTarget: target)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        appLogger.notice("Gesture input revision 11: late vertical motion and same-app focus recovery")
         appLogger.notice(
             "Permissions accessibility=\(AccessibilityPermission.isGranted) screenRecording=\(ScreenRecordingPermission.isGranted)"
         )
@@ -33,6 +42,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setUpStatusItem()
         observeSettings()
         syncEngine()
+        appActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.syncEngine()
+            }
+        }
 
         if !AccessibilityPermission.isGranted {
             AccessibilityPermission.request()
@@ -40,6 +58,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let appActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(appActivationObserver)
+        }
         engine.stop()
         executor.restoreWindowLevels()
     }
@@ -51,11 +72,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func setUpStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image =
-            NSImage(
-                systemSymbolName: "cursorarrow.motionlines",
-                accessibilityDescription: "鼠标手势"
-            ) ?? NSImage(systemSymbolName: "cursorarrow.rays", accessibilityDescription: "鼠标手势")
+        let image = Bundle.main.url(forResource: "MenuBarIcon", withExtension: "png")
+            .flatMap { NSImage(contentsOf: $0) }
+            ?? NSImage(systemSymbolName: "cursorarrow.motionlines", accessibilityDescription: "鼠标手势")
+        image?.size = NSSize(width: 18, height: 18)
+        image?.isTemplate = true
+        image?.accessibilityDescription = "鼠标手势"
+        item.button?.image = image
+        item.button?.toolTip = "MouseGesture · 鼠标手势"
 
         let menu = NSMenu()
         menu.delegate = self
@@ -120,6 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func syncEngine() {
+        if !store.configuration.enabled { executor.cancelPendingShortcut() }
         engine.update(
             enabled: store.configuration.enabled,
             threshold: CGFloat(store.configuration.threshold)
@@ -150,7 +175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             )
             window.title = "鼠标手势设置"
             window.isReleasedWhenClosed = false
-            window.contentView = NSHostingView(rootView: SettingsView(store: store))
+            window.contentView = NSHostingView(rootView: settingsContent)
             window.center()
             settingsWindow = window
         }

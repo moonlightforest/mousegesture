@@ -23,6 +23,9 @@ fi
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
 cp "$BIN_DIR/MouseGesture" "$CONTENTS_DIR/MacOS/MouseGesture"
 cp "$PROJECT_DIR/Resources/Info.plist" "$CONTENTS_DIR/Info.plist"
+cp "$PROJECT_DIR/Resources/MouseGesture.icns" "$CONTENTS_DIR/Resources/"
+cp "$PROJECT_DIR/Resources/MenuBarIcon.png" "$CONTENTS_DIR/Resources/"
+cp "$PROJECT_DIR/Resources/MenuBarIcon@2x.png" "$CONTENTS_DIR/Resources/"
 
 CODESIGN_IDENTITY=${MOUSEGESTURE_CODESIGN_IDENTITY:--}
 codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_DIR"

@@ -8,22 +8,69 @@ import OSLog
 
 private let windowLogger = Logger(subsystem: "com.yaoyinliang.MouseGesture", category: "WindowActions")
 
+struct ShortcutTarget {
+    let gestureID: UUID
+    let application: NSRunningApplication
+    let applicationElement: AXUIElement
+    let window: AXUIElement?
+}
+
+private func focusedWindow(of application: AXUIElement) -> AXUIElement? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(application, kAXFocusedWindowAttribute as CFString, &value) == .success,
+        let value, CFGetTypeID(value) == AXUIElementGetTypeID()
+    else { return nil }
+    return (value as! AXUIElement)
+}
+
 @MainActor
 final class ActionExecutor {
     private let windowController = WindowController()
+    private var pendingShortcut: Task<Void, Never>?
+    private var gestureID = UUID()
+
+    func cancelPendingShortcut() {
+        pendingShortcut?.cancel()
+        pendingShortcut = nil
+        gestureID = UUID()
+    }
+
+    // Only sample the application during the event-tap callback. AX requests
+    // can take longer than a short gesture, so resolve its focused window off
+    // the input run loop while the button remains held.
+    func captureShortcutTarget() -> Task<ShortcutTarget?, Never> {
+        cancelPendingShortcut()
+        let front = NSWorkspace.shared.frontmostApplication
+        let applicationCandidate = (front?.processIdentifier ?? -1) > 0 ? front
+            : NSWorkspace.shared.runningApplications.first { $0.isActive && $0.processIdentifier > 0 }
+        guard let application = applicationCandidate,
+            application.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        else { return Task { nil } }
+        let capturedGestureID = gestureID
+        return Task.detached(priority: .userInitiated) {
+            let element = AXUIElementCreateApplication(application.processIdentifier)
+            AXUIElementSetMessagingTimeout(element, 0.03)
+            let window = focusedWindow(of: element)
+            if let window { AXUIElementSetMessagingTimeout(window, 0.03) }
+            windowLogger.notice("Shortcut captured application pid=\(application.processIdentifier) windowAvailable=\(window != nil)")
+            return ShortcutTarget(gestureID: capturedGestureID, application: application,
+                                  applicationElement: element, window: window)
+        }
+    }
 
     func restoreWindowLevels() {
+        cancelPendingShortcut()
         windowController.restorePinnedWindows()
     }
 
-    func execute(_ action: GestureAction, gestureLocation: CGPoint) {
+    func execute(_ action: GestureAction, gestureLocation: CGPoint, shortcutTarget: ShortcutTarget?) {
         switch action.kind {
         case .none:
             break
         case .copy:
-            postShortcut(keyCode: 8, modifiers: .maskCommand)
+            postClipboardShortcut(keyCode: 8, target: shortcutTarget)
         case .paste:
-            postShortcut(keyCode: 9, modifiers: .maskCommand)
+            postClipboardShortcut(keyCode: 9, target: shortcutTarget)
         case .previousWindow:
             windowController.activatePreviousWindow(from: gestureLocation)
         case .toggleAlwaysOnTop:
@@ -45,7 +92,57 @@ final class ActionExecutor {
         }
     }
 
-    private func postShortcut(keyCode: CGKeyCode, modifiers: CGEventFlags) {
+    private func postClipboardShortcut(keyCode: CGKeyCode, target: ShortcutTarget?) {
+        guard let target else {
+            windowLogger.notice("Shortcut cancelled: no valid original application captured at mouse-down")
+            return
+        }
+        // A newer press or disabling gestures invalidates even an action that
+        // was already queued by the previous mouse-up callback.
+        guard target.gestureID == gestureID else { return }
+        pendingShortcut?.cancel()
+        pendingShortcut = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled, !target.application.isTerminated else { return }
+            let deadline = ProcessInfo.processInfo.systemUptime + 0.6
+            var stableWindow: AXUIElement?
+            var stableSince = ProcessInfo.processInfo.systemUptime
+            while !Task.isCancelled, !target.application.isTerminated {
+                guard target.gestureID == self.gestureID,
+                    NSWorkspace.shared.frontmostApplication?.processIdentifier == target.application.processIdentifier
+                else {
+                    windowLogger.notice("Shortcut cancelled: original application no longer active")
+                    return
+                }
+                if let current = focusedWindow(of: target.applicationElement) {
+                    let now = ProcessInfo.processInfo.systemUptime
+                    if stableWindow == nil || !CFEqual(stableWindow!, current) {
+                        stableWindow = current
+                        stableSince = now
+                    }
+                    let capturedMatches = target.window.map { CFEqual($0, current) }
+                    if ClipboardFocusPolicy.canSend(originalPID: target.application.processIdentifier,
+                        currentPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+                        capturedWindowMatches: capturedMatches, recoveredWindowStable: now - stableSince >= 0.03) {
+                        self.postShortcut(keyCode: keyCode, modifiers: .maskCommand,
+                                          targetPID: target.application.processIdentifier)
+                        windowLogger.notice("Shortcut sent after focus confirmation pid=\(target.application.processIdentifier) key=\(keyCode) recoveredWindow=\(target.window == nil)")
+                        return
+                    }
+                }
+                guard ProcessInfo.processInfo.systemUptime < deadline else { break }
+                do {
+                    try await Task.sleep(nanoseconds: 30_000_000)
+                } catch {
+                    return
+                }
+            }
+            if !Task.isCancelled {
+                windowLogger.notice("Shortcut cancelled: captured window did not acquire focus pid=\(target.application.processIdentifier)")
+            }
+        }
+    }
+
+    private func postShortcut(keyCode: CGKeyCode, modifiers: CGEventFlags, targetPID: pid_t? = nil) {
         let source = CGEventSource(stateID: .hidSystemState)
         guard
             let down = CGEvent(
@@ -64,8 +161,13 @@ final class ActionExecutor {
         up.flags = modifiers
         down.setIntegerValueField(.eventSourceUserData, value: GestureEngine.syntheticEventMarker)
         up.setIntegerValueField(.eventSourceUserData, value: GestureEngine.syntheticEventMarker)
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+        if let targetPID {
+            down.postToPid(targetPID)
+            up.postToPid(targetPID)
+        } else {
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        }
     }
 
     private func launchApplication(at path: String?) {
@@ -158,40 +260,43 @@ private final class WindowController: NSObject {
         if let current { record(current) }
 
         let currentID = current?.id
-        windowLogger.debug("Previous-window action current=\(currentID ?? 0) history=\(self.recentWindows.count)")
+        windowLogger.notice("Previous-window action current=\(currentID ?? 0) history=\(self.recentWindows.count)")
 
         if switchPair.count == 2,
             currentID == nil || switchPair.contains(where: { $0.id == currentID }),
-            let lastSwitchTargetID,
-            let target = switchPair.first(where: { $0.id != lastSwitchTargetID }),
+            let target = switchPair.first(where: {
+                $0.id != (currentID ?? lastSwitchTargetID)
+            }),
             let liveTarget = liveWindow(matching: target)
         {
-            windowLogger.debug("Toggling paired window=\(liveTarget.id) pid=\(liveTarget.ownerPID)")
+            windowLogger.notice("Toggling paired window=\(liveTarget.id) pid=\(liveTarget.ownerPID)")
             self.lastSwitchTargetID = liveTarget.id
             focus(liveTarget)
-            record(liveTarget)
             return
         }
 
         switchPair.removeAll()
         lastSwitchTargetID = nil
 
-        if let target = recentWindows.first(where: {
-            $0.id != currentID && isEligible($0)
-        }) {
-            windowLogger.debug("Focusing history window=\(target.id) pid=\(target.ownerPID)")
+        if let target = recentWindows.lazy
+            .filter({ $0.id != currentID })
+            .compactMap({ self.liveWindow(matching: $0) })
+            .first
+        {
+            windowLogger.notice("Focusing history window=\(target.id) pid=\(target.ownerPID)")
             beginSwitchPair(current: current, target: target)
             focus(target)
-            record(target)
             return
         }
 
         if let fallback = allWindows().first(where: {
-            $0.id != currentID && isEligible($0) && $0.isOnScreen
+            $0.id != currentID && isEligible($0) && $0.isOnScreen && !isStageManagerThumbnail($0)
         }) {
+            windowLogger.notice("Focusing fallback window=\(fallback.id) pid=\(fallback.ownerPID)")
             beginSwitchPair(current: current, target: fallback)
             focus(fallback)
-            record(fallback)
+        } else {
+            windowLogger.notice("Previous-window action found no eligible target")
         }
     }
 
@@ -204,7 +309,12 @@ private final class WindowController: NSObject {
 
     private func liveWindow(matching savedWindow: WindowInfo) -> WindowInfo? {
         guard isEligible(savedWindow) else { return nil }
-        return allWindows().first(where: { $0.id == savedWindow.id && isEligible($0) }) ?? savedWindow
+        guard let live = allWindows().first(where: {
+            $0.id == savedWindow.id && $0.ownerPID == savedWindow.ownerPID && isEligible($0)
+        }) else { return nil }
+        // Stage Manager shrinks the same window ID into a shelf preview. Keep its
+        // original full-size geometry for matching the AX window when raising it.
+        return isStageManagerThumbnail(live) ? savedWindow : live
     }
 
     fileprivate func recordCurrentWindow() {
@@ -213,7 +323,7 @@ private final class WindowController: NSObject {
     }
 
     private func record(_ info: WindowInfo) {
-        guard isEligible(info) else { return }
+        guard isEligible(info), info.isOnScreen, !isStageManagerThumbnail(info) else { return }
         recentWindows.removeAll { $0.id == info.id }
         recentWindows.insert(info, at: 0)
         if recentWindows.count > 12 {
@@ -270,14 +380,16 @@ private final class WindowController: NSObject {
 
     private func window(at location: CGPoint) -> WindowInfo? {
         allWindows().first {
-            isEligible($0) && $0.isOnScreen && $0.bounds.contains(location)
+            isEligible($0) && $0.isOnScreen && !isStageManagerThumbnail($0)
+                && $0.bounds.contains(location)
         }
     }
 
     private func focusedWindowInfo() -> WindowInfo? {
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
         let candidates = allWindows().filter {
-            $0.ownerPID == app.processIdentifier && isEligible($0)
+            $0.ownerPID == app.processIdentifier && isEligible($0) && $0.isOnScreen
+                && !isStageManagerThumbnail($0)
         }
         guard !candidates.isEmpty else { return nil }
 
@@ -297,7 +409,8 @@ private final class WindowController: NSObject {
 
     private func focus(_ info: WindowInfo) {
         guard let runningApplication = NSRunningApplication(processIdentifier: info.ownerPID) else { return }
-        runningApplication.activate(options: [])
+        let activated = runningApplication.activate(options: [])
+        windowLogger.notice("Activating window=\(info.id) pid=\(info.ownerPID) accepted=\(activated)")
         setWindowServerFocus(info)
         raise(info)
         DispatchQueue.main.async { [weak self] in
@@ -318,7 +431,7 @@ private final class WindowController: NSObject {
             return
         }
         let focusResult = setFrontProcess(&processSerialNumber, info.id, 0x200)
-        windowLogger.debug("WindowServer focus window=\(info.id) result=\(focusResult)")
+        windowLogger.notice("WindowServer focus window=\(info.id) result=\(focusResult)")
     }
 
     private func raise(_ info: WindowInfo) {
@@ -369,6 +482,11 @@ private final class WindowController: NSObject {
         else { return false }
 
         return info.layer == 0 && info.alpha > 0 && info.bounds.width >= 120 && info.bounds.height >= 80
+    }
+
+    private func isStageManagerThumbnail(_ info: WindowInfo) -> Bool {
+        info.isOnScreen && info.bounds.minX <= 50
+            && info.bounds.width < 200 && info.bounds.height < 200
     }
 
     private func matchScore(_ info: WindowInfo, title: String, frame: CGRect?) -> CGFloat {

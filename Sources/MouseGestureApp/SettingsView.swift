@@ -21,13 +21,13 @@ struct SettingsView: View {
             HStack(spacing: 14) {
                 Text("移动阈值")
                     .frame(width: 76, alignment: .leading)
-                Slider(value: thresholdBinding, in: 20...100, step: 1)
-                Text("\(Int(store.configuration.threshold)) px")
+                Slider(value: thresholdBinding, in: 8...100, step: 1)
+                Text("\(Int(store.configuration.threshold)) pt")
                     .monospacedDigit()
                     .frame(width: 52, alignment: .trailing)
             }
 
-            Text("按住右键移动超过阈值并释放后执行动作；未超过阈值时仍是普通右键点击。")
+            Text("按住右键移动达到阈值并释放后执行动作；上滑复制最短 3 pt；下滑限垂直左右各 20°，连续两段同向短下滑可在 \(Int(ShortVerticalStroke.minimumDistance(for: CGFloat(store.configuration.threshold)))) pt 触发。")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -47,7 +47,7 @@ private struct ActionRow: View {
     @ObservedObject var store: SettingsStore
     let direction: GestureDirection
 
-    @State private var showingShortcutRecorder = false
+    private var showingShortcutRecorder = State(initialValue: false)
 
     var body: some View {
         HStack(spacing: 12) {
@@ -81,10 +81,13 @@ private struct ActionRow: View {
             .lineLimit(1)
         case .keyboardShortcut:
             Button(ShortcutFormatter.display(action.shortcut) ?? "录制…") {
-                showingShortcutRecorder = true
+                showingShortcutRecorder.wrappedValue = true
             }
-            .sheet(isPresented: $showingShortcutRecorder) {
-                ShortcutRecorderSheet(initialShortcut: action.shortcut) { shortcut in
+            .sheet(isPresented: showingShortcutRecorder.projectedValue) {
+                ShortcutRecorderSheet(
+                    initialShortcut: action.shortcut,
+                    isPresented: showingShortcutRecorder.projectedValue
+                ) { shortcut in
                     var updated = store.action(for: direction)
                     updated.shortcut = shortcut
                     store.setAction(updated, for: direction)
@@ -134,13 +137,18 @@ private struct ActionRow: View {
 }
 
 private struct ShortcutRecorderSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    @State private var shortcut: RecordedShortcut?
+    private var shortcut: State<RecordedShortcut?>
 
+    let isPresented: Binding<Bool>
     let onSave: (RecordedShortcut) -> Void
 
-    init(initialShortcut: RecordedShortcut?, onSave: @escaping (RecordedShortcut) -> Void) {
-        _shortcut = State(initialValue: initialShortcut)
+    init(
+        initialShortcut: RecordedShortcut?,
+        isPresented: Binding<Bool>,
+        onSave: @escaping (RecordedShortcut) -> Void
+    ) {
+        shortcut = State(initialValue: initialShortcut)
+        self.isPresented = isPresented
         self.onSave = onSave
     }
 
@@ -151,14 +159,14 @@ private struct ShortcutRecorderSheet: View {
             Text("直接按下要使用的组合键")
                 .foregroundStyle(.secondary)
 
-            Text(ShortcutFormatter.display(shortcut) ?? "等待输入…")
+            Text(ShortcutFormatter.display(shortcut.wrappedValue) ?? "等待输入…")
                 .font(.system(size: 28, weight: .medium, design: .rounded))
                 .frame(maxWidth: .infinity, minHeight: 54)
                 .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
 
             KeyCaptureView { event in
                 let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-                shortcut = RecordedShortcut(
+                shortcut.wrappedValue = RecordedShortcut(
                     keyCode: event.keyCode,
                     modifierRawValue: UInt64(modifiers.rawValue)
                 )
@@ -166,14 +174,14 @@ private struct ShortcutRecorderSheet: View {
             .frame(width: 1, height: 1)
 
             HStack {
-                Button("取消") { dismiss() }
+                Button("取消") { isPresented.wrappedValue = false }
                 Spacer()
                 Button("保存") {
-                    if let shortcut { onSave(shortcut) }
-                    dismiss()
+                    if let shortcut = shortcut.wrappedValue { onSave(shortcut) }
+                    isPresented.wrappedValue = false
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(shortcut == nil)
+                .disabled(shortcut.wrappedValue == nil)
             }
         }
         .padding(24)

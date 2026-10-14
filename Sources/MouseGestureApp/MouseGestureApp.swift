@@ -6,7 +6,7 @@ struct MouseGestureApplication: App {
 
     var body: some Scene {
         Settings {
-            EmptyView()
+            appDelegate.settingsContent
         }
     }
 }
