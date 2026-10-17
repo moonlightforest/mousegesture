@@ -1,3 +1,4 @@
+import AppKit
 import ApplicationServices
 import CoreGraphics
 import Foundation
@@ -6,42 +7,10 @@ import OSLog
 
 private let gestureLogger = Logger(subsystem: "com.yaoyinliang.MouseGesture", category: "GestureEngine")
 
+enum InputListenerStatus { case running, paused, faulted, permissionMissing }
+
 final class GestureEngine {
     static let syntheticEventMarker: Int64 = 0x4D47_5354
-    private static let postReleaseWindowMs = 120
-
-    private struct DeferredRightClick {
-        let id = UUID()
-        let location: CGPoint
-        let startedAt: CGPoint
-        let threshold: CGFloat
-        let releasedAt = ProcessInfo.processInfo.systemUptime
-        let shortcutTarget: Task<ShortcutTarget?, Never>
-        var stroke: GestureStroke
-        var shortStroke: ShortVerticalStroke
-        var moveCount = 0
-
-        init(completed: TrackingState, location: CGPoint) {
-            self.location = location
-            startedAt = completed.stroke.start
-            threshold = completed.thresholdAtMouseDown
-            shortcutTarget = completed.shortcutTarget
-            stroke = completed.stroke
-            shortStroke = completed.shortVerticalStroke
-        }
-
-        mutating func record(_ location: CGPoint) {
-            stroke.record(location)
-            shortStroke.recordDrag(location)
-            moveCount += 1
-        }
-
-        var recoveredDirection: GestureDirection? {
-            PostReleaseGesture.direction(stroke: stroke, shortStroke: shortStroke,
-                moveCount: moveCount, threshold: threshold)
-        }
-
-    }
 
     private struct TrackingState {
         var stroke: GestureStroke
@@ -50,15 +19,21 @@ final class GestureEngine {
         var firstCommittedDirection: GestureDirection?
         var relativeStroke = GestureStroke(start: .zero)
         var relativePosition = CGPoint.zero
+        let token: InputToken
         let shortcutTarget: Task<ShortcutTarget?, Never>
         let startedAt = ProcessInfo.processInfo.systemUptime
+        let prePressMotion: [MotionSample]
+        var dragPoints: [CGPoint] = []
         var dragCount = 0
         var moveCount = 0
 
-        init(start: CGPoint, threshold: CGFloat, shortcutTarget: Task<ShortcutTarget?, Never>) {
+        init(start: CGPoint, threshold: CGFloat, token: InputToken, shortcutTarget: Task<ShortcutTarget?, Never>,
+             prePressMotion: [MotionSample]) {
+            self.prePressMotion = prePressMotion
             stroke = GestureStroke(start: start)
             shortVerticalStroke = ShortVerticalStroke(start: start)
             thresholdAtMouseDown = threshold
+            self.token = token
             self.shortcutTarget = shortcutTarget
         }
 
@@ -72,6 +47,7 @@ final class GestureEngine {
         mutating func recordDrag(_ event: CGEvent) {
             record(event)
             shortVerticalStroke.recordDrag(event.location)
+            if dragPoints.count < 256 { dragPoints.append(event.location) }
             dragCount += 1
             if firstCommittedDirection == nil, dragCount >= 2 {
                 firstCommittedDirection = GestureClassifier(threshold: thresholdAtMouseDown)
@@ -80,48 +56,73 @@ final class GestureEngine {
         }
     }
 
-    private let lock = NSLock()
+    private let inputLoop = InputRunLoop()
+    private let diagnosticsQueue = DispatchQueue(label: "MouseGesture.Diagnostics")
+    private let lifetime: InputLifetime
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var tracking: TrackingState?
-    private var deferredRightClick: DeferredRightClick?
+    private var recentMotion = RecentMotion()
+    private var rightPressCaptured = false
     private var enabled = true
     private var inputFaulted = false
     private var threshold: CGFloat = 40
     private var nextRightClickEventNumber: Int64 = 0
-    private let captureShortcutTarget: () -> Task<ShortcutTarget?, Never>
-    private let actionHandler: (GestureDirection, CGPoint, ShortcutTarget?) -> Void
+    private let captureShortcutTarget: @MainActor (InputToken) -> Task<ShortcutTarget?, Never>
+    private let actionHandler: @MainActor (GestureDirection, CGPoint, ShortcutTarget?, InputToken) -> Void
+    private let statusHandler: (InputListenerStatus) -> Void
 
-    init(captureShortcutTarget: @escaping () -> Task<ShortcutTarget?, Never>,
-         actionHandler: @escaping (GestureDirection, CGPoint, ShortcutTarget?) -> Void) {
+    init(lifetime: InputLifetime,
+         captureShortcutTarget: @escaping @MainActor (InputToken) -> Task<ShortcutTarget?, Never>,
+         actionHandler: @escaping @MainActor (GestureDirection, CGPoint, ShortcutTarget?, InputToken) -> Void,
+         statusHandler: @escaping (InputListenerStatus) -> Void) {
+        self.lifetime = lifetime
         self.captureShortcutTarget = captureShortcutTarget
         self.actionHandler = actionHandler
-    }
-
-    deinit {
-        stop()
+        self.statusHandler = statusHandler
     }
 
     func update(enabled: Bool, threshold: CGFloat) {
-        lock.lock()
-        self.enabled = enabled && !inputFaulted
-        self.threshold = threshold
-        if !enabled {
-            tracking = nil
-            deferredRightClick = nil
+        lifetime.configure(enabled: enabled)
+        inputLoop.perform { [weak self] in
+            guard let self else { return }
+            self.enabled = enabled
+            self.threshold = threshold
+            if !enabled { self.stopOnInputThread(); self.publish(.paused) }
         }
-        lock.unlock()
+    }
+    func foregroundChanged(to pid: Int32) {
+        guard lifetime.foregroundChanged(to: pid) else { return }
+        inputLoop.perform { [weak self] in self?.tracking = nil; self?.recentMotion.removeAll() }
+    }
+    func recover() {
+        lifetime.recover()
+        inputLoop.perform { [weak self] in
+            guard let self else { return }
+            self.stopOnInputThread()
+            self.inputFaulted = false
+            _ = self.startOnInputThread()
+        }
+    }
+    private func publish(_ status: InputListenerStatus) {
+        DispatchQueue.main.async { [statusHandler] in statusHandler(status) }
+    }
+    func start() {
+        inputLoop.perform { [weak self] in _ = self?.startOnInputThread() }
     }
 
     @discardableResult
-    func start() -> Bool {
-        guard !inputFaulted, eventTap == nil, AccessibilityPermission.isGranted else { return eventTap != nil }
+    private func startOnInputThread() -> Bool {
+        guard enabled else { publish(.paused); return false }
+        guard !inputFaulted else { publish(.faulted); return false }
+        guard AccessibilityPermission.isGranted else { publish(.permissionMissing); return false }
+        guard eventTap == nil else { return true }
 
         let interestedTypes: [CGEventType] = [
             .rightMouseDown,
             .rightMouseDragged,
             .rightMouseUp,
-            .mouseMoved
+            .mouseMoved, .leftMouseDown, .otherMouseDown, .keyDown, .scrollWheel
         ]
         let mask = interestedTypes.reduce(CGEventMask(0)) { partial, type in
             partial | (CGEventMask(1) << type.rawValue)
@@ -143,44 +144,49 @@ final class GestureEngine {
                 userInfo: Unmanaged.passUnretained(self).toOpaque()
             )
         else {
-            gestureLogger.error("Could not create the right-mouse event tap")
+            inputFaulted = true
+            lifetime.fault()
+            publish(.faulted)
             return false
         }
 
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         eventTap = tap
         runLoopSource = source
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .defaultMode)
         CGEvent.tapEnable(tap: tap, enable: true)
-        gestureLogger.notice("Right-mouse event tap started")
+        publish(.running)
+        diagnosticsQueue.async { gestureLogger.notice("Right-mouse event tap started on dedicated input thread") }
         return true
     }
 
     func stop() {
-        if let eventTap {
-            CGEvent.tapEnable(tap: eventTap, enable: false)
-        }
-        if let runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
-        }
+        lifetime.invalidate()
+        inputLoop.perform { [weak self] in self?.stopOnInputThread(); self?.publish(.paused) }
+    }
+    func shutdown() {
+        stop()
+        inputLoop.shutdown()
+    }
+    private func stopOnInputThread() {
+        if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: false); CFMachPortInvalidate(eventTap) }
+        if let runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetCurrent(), runLoopSource, .defaultMode) }
         eventTap = nil
         runLoopSource = nil
-        lock.lock()
         tracking = nil
-        deferredRightClick = nil
-        lock.unlock()
+        recentMotion.removeAll()
+        rightPressCaptured = false
     }
 
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             // Fail open: a repeatedly re-enabled filter can interfere with the
-            // whole input session. Require an app restart after an input fault.
-            gestureLogger.error("Input listener disabled by system; stopping interception until app restart")
+            // whole input session. Require manual recovery after an input fault.
+            diagnosticsQueue.async { gestureLogger.error("Input listener disabled by system; interception stopped until manual recovery") }
             inputFaulted = true
-            stop()
-            lock.lock()
-            enabled = false
-            lock.unlock()
+            lifetime.fault()
+            stopOnInputThread()
+            publish(.faulted)
             return Unmanaged.passUnretained(event)
         }
 
@@ -188,64 +194,70 @@ final class GestureEngine {
             return Unmanaged.passUnretained(event)
         }
 
-        lock.lock()
-        let isEnabled = enabled
-        lock.unlock()
+        let isEnabled = enabled && !inputFaulted
         guard isEnabled else { return Unmanaged.passUnretained(event) }
 
         switch type {
+        case .leftMouseDown, .otherMouseDown, .keyDown, .scrollWheel:
+            lifetime.invalidate()
+            tracking = nil
+            recentMotion.removeAll()
+            return Unmanaged.passUnretained(event)
+
         case .rightMouseDown:
-            let target = captureShortcutTarget()
-            lock.lock()
-            let oldClick = deferredRightClick
-            deferredRightClick = nil
-            tracking = TrackingState(start: event.location, threshold: threshold, shortcutTarget: target)
-            lock.unlock()
-            if let oldClick {
-                // Preserve an ordinary click when a second press arrives before
-                // its short post-release observation window has expired.
-                DispatchQueue.main.async { [weak self] in
-                    self?.postNativeRightClick(at: oldClick.location)
-                }
+            rightPressCaptured = true
+            let token = lifetime.begin()
+            let prePressMotion = recentMotion.samples
+            recentMotion.removeAll()
+            let target = Task { @MainActor [captureShortcutTarget, lifetime] in
+                guard lifetime.isCurrent(token) else { return nil as ShortcutTarget? }
+                return await captureShortcutTarget(token).value
             }
+            tracking = TrackingState(start: event.location, threshold: threshold, token: token, shortcutTarget: target,
+                                     prePressMotion: prePressMotion)
             return nil
 
         case .rightMouseDragged:
-            lock.lock()
             tracking?.recordDrag(event)
-            lock.unlock()
-            return nil
+            return rightPressCaptured ? nil : Unmanaged.passUnretained(event)
 
         case .mouseMoved:
-            lock.lock()
             if tracking != nil {
                 tracking?.record(event)
                 tracking?.shortVerticalStroke.recordDrag(event.location)
                 tracking?.moveCount += 1
-            } else if let pending = deferredRightClick,
-                ProcessInfo.processInfo.systemUptime - pending.releasedAt
-                    <= Double(Self.postReleaseWindowMs) / 1_000 {
-                deferredRightClick?.record(event.location)
+            } else {
+                recentMotion.record(event.location, at: ProcessInfo.processInfo.systemUptime)
             }
-            lock.unlock()
             return Unmanaged.passUnretained(event)
 
         case .rightMouseUp:
-            lock.lock()
+            let intercepted = rightPressCaptured
+            rightPressCaptured = false
             var completed = tracking
             completed?.record(event)
             completed?.shortVerticalStroke.recordDrag(event.location)
             tracking = nil
             let currentThreshold = threshold
-            lock.unlock()
 
-            guard let completed else { return Unmanaged.passUnretained(event) }
+            guard let completed, lifetime.isCurrent(completed.token) else {
+                return intercepted ? nil : Unmanaged.passUnretained(event)
+            }
             let originalCoordinateDirection = completed.stroke.direction(threshold: currentThreshold)
             let coordinateDirection = completed.stroke.direction(
                 threshold: currentThreshold, preferring: completed.firstCommittedDirection
             )
             let relativeDirection = completed.relativeStroke.direction(threshold: currentThreshold)
             let shortVerticalDirection = completed.shortVerticalStroke.direction(threshold: currentThreshold)
+            let prePressDirection = PrePressGesture.direction(
+                before: completed.prePressMotion, pressedAt: completed.startedAt, press: completed.stroke.start,
+                drags: completed.dragPoints, release: event.location,
+                releasedAt: ProcessInfo.processInfo.systemUptime, threshold: currentThreshold
+            )
+            let prePressOffset = completed.prePressMotion.first.map {
+                CGPoint(x: completed.stroke.start.x - $0.point.x, y: completed.stroke.start.y - $0.point.y)
+            } ?? .zero
+            let pressGapMs = completed.prePressMotion.last.map { Int((completed.startedAt - $0.time) * 1_000) } ?? -1
             let coordinateOffset = completed.stroke.furthestDisplacement
             let axisPeak = completed.stroke.axisPeakDisplacement
             let relativeOffset = completed.relativeStroke.furthestDisplacement
@@ -261,74 +273,38 @@ final class GestureEngine {
             case nil: deltaIsAligned = false
             }
             let deltaDirection = deltaIsAligned ? relativeDirection : nil
-            let direction = coordinateDirection ?? deltaDirection ?? shortVerticalDirection
-            let decisionPath = coordinateDirection != nil
+            let direction = prePressDirection ?? coordinateDirection ?? deltaDirection ?? shortVerticalDirection
+            let decisionPath = prePressDirection != nil ? "pre-press" : coordinateDirection != nil
                 ? (coordinateDirection == originalCoordinateDirection ? "coordinate" : "first-direction")
                 : (deltaDirection != nil ? "delta" : (shortVerticalDirection != nil ? "short-vertical" : "none"))
             let durationMs = Int((ProcessInfo.processInfo.systemUptime - completed.startedAt) * 1_000)
+            diagnosticsQueue.async {
             gestureLogger.notice(
-                "Right gesture direction=\(direction?.rawValue ?? "none", privacy: .public) path=\(decisionPath, privacy: .public) threshold=\(Int(currentThreshold)) shortThreshold=\(Int(ShortVerticalStroke.minimumDistance(for: currentThreshold))) start=(\(Int(completed.stroke.start.x)),\(Int(completed.stroke.start.y))) coord=(\(Int(coordinateOffset.x)),\(Int(coordinateOffset.y))) axisPeak=(\(Int(axisPeak.x)),\(Int(axisPeak.y))) first=\(completed.firstCommittedDirection?.rawValue ?? "none", privacy: .public) delta=(\(Int(relativeOffset.x)),\(Int(relativeOffset.y))) durationMs=\(durationMs) drags=\(completed.dragCount) moves=\(completed.moveCount)"
+                "Right gesture direction=\(direction?.rawValue ?? "none", privacy: .public) path=\(decisionPath, privacy: .public) threshold=\(Int(currentThreshold)) shortThreshold=\(Int(ShortVerticalStroke.minimumDistance(for: currentThreshold))) start=(\(Int(completed.stroke.start.x)),\(Int(completed.stroke.start.y))) coord=(\(Int(coordinateOffset.x)),\(Int(coordinateOffset.y))) axisPeak=(\(Int(axisPeak.x)),\(Int(axisPeak.y))) first=\(completed.firstCommittedDirection?.rawValue ?? "none", privacy: .public) delta=(\(Int(relativeOffset.x)),\(Int(relativeOffset.y))) durationMs=\(durationMs) drags=\(completed.dragCount) moves=\(completed.moveCount) prePress=(\(Int(prePressOffset.x)),\(Int(prePressOffset.y))) prePressSamples=\(completed.prePressMotion.count) pressGapMs=\(pressGapMs)"
             )
+            }
             if let direction {
-                Task { @MainActor [actionHandler] in
+                Task { @MainActor [actionHandler, lifetime] in
                     let target = await completed.shortcutTarget.value
-                    actionHandler(direction, completed.stroke.start, target)
+                    guard lifetime.isCurrent(completed.token) else { return }
+                    actionHandler(direction, completed.stroke.start, target, completed.token)
                 }
             } else {
-                let location = event.location
                 if hypot(coordinateOffset.x, coordinateOffset.y) >= currentThreshold {
-                    gestureLogger.notice("Unassigned diagonal drag suppressed; no right-click replay")
+                    diagnosticsQueue.async { gestureLogger.notice("Unassigned diagonal drag suppressed; no right-click replay") }
                     return nil
                 }
-                if completed.dragCount == 0 && completed.moveCount == 0 {
-                    // Deskflow's movement can arrive after release even when
-                    // the press lasted over 100 ms. Recover a supported gesture
-                    // without treating a zero-motion click as a gesture.
-                    let deferred = DeferredRightClick(completed: completed, location: location)
-                    lock.lock()
-                    deferredRightClick = deferred
-                    lock.unlock()
-                    DispatchQueue.main.asyncAfter(
-                        deadline: .now() + .milliseconds(Self.postReleaseWindowMs)
-                    ) { [weak self] in
-                        self?.finishDeferredRightClick(id: deferred.id)
-                    }
-                } else {
-                    // Posting into the HID stream from this synchronous event-tap
-                    // callback can stall the tap. Replay after returning instead.
-                    DispatchQueue.main.async { [weak self] in
-                        self?.postNativeRightClick(at: location)
-                    }
+                // Posting into the HID stream from this synchronous event-tap
+                // callback can stall the tap. Replay after returning instead.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, NSWorkspace.shared.frontmostApplication?.processIdentifier == completed.token.applicationPID, self.lifetime.claim(completed.token) else { return }
+                    self.postNativeRightClick(at: completed.stroke.start)
                 }
             }
             return nil
 
         default:
             return Unmanaged.passUnretained(event)
-        }
-    }
-
-    private func finishDeferredRightClick(id: UUID) {
-        lock.lock()
-        guard let deferred = deferredRightClick, deferred.id == id else {
-            lock.unlock()
-            return
-        }
-        deferredRightClick = nil
-        lock.unlock()
-
-        if let direction = deferred.recoveredDirection {
-            let offset = deferred.stroke.axisPeakDisplacement
-            gestureLogger.notice(
-                "Recovered gesture direction=\(direction.rawValue, privacy: .public) from post-release motion start=(\(Int(deferred.startedAt.x)),\(Int(deferred.startedAt.y))) axisPeak=(\(Int(offset.x)),\(Int(offset.y))) moves=\(deferred.moveCount)"
-            )
-            Task { @MainActor [actionHandler] in
-                let target = await deferred.shortcutTarget.value
-                actionHandler(direction, deferred.startedAt, target)
-            }
-        } else {
-            gestureLogger.notice("Deferred ordinary right-click replay lateMoves=\(deferred.moveCount)")
-            postNativeRightClick(at: deferred.location)
         }
     }
 

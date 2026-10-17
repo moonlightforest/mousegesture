@@ -1,5 +1,5 @@
 import AppKit
-import ApplicationServices
+@preconcurrency import ApplicationServices
 import Carbon
 import CoreGraphics
 import Darwin
@@ -9,7 +9,7 @@ import OSLog
 private let windowLogger = Logger(subsystem: "com.yaoyinliang.MouseGesture", category: "WindowActions")
 
 struct ShortcutTarget {
-    let gestureID: UUID
+    let token: InputToken
     let application: NSRunningApplication
     let applicationElement: AXUIElement
     let window: AXUIElement?
@@ -27,34 +27,45 @@ private func focusedWindow(of application: AXUIElement) -> AXUIElement? {
 final class ActionExecutor {
     private let windowController = WindowController()
     private var pendingShortcut: Task<Void, Never>?
-    private var gestureID = UUID()
+    private let lifetime: InputLifetime
+    private let axQueue = DispatchQueue(label: "MouseGesture.ClipboardAX", qos: .userInitiated)
+
+    init(lifetime: InputLifetime) { self.lifetime = lifetime }
 
     func cancelPendingShortcut() {
         pendingShortcut?.cancel()
         pendingShortcut = nil
-        gestureID = UUID()
+        lifetime.invalidate()
     }
 
-    // Only sample the application during the event-tap callback. AX requests
-    // can take longer than a short gesture, so resolve its focused window off
-    // the input run loop while the button remains held.
-    func captureShortcutTarget() -> Task<ShortcutTarget?, Never> {
-        cancelPendingShortcut()
-        let front = NSWorkspace.shared.frontmostApplication
-        let applicationCandidate = (front?.processIdentifier ?? -1) > 0 ? front
-            : NSWorkspace.shared.runningApplications.first { $0.isActive && $0.processIdentifier > 0 }
-        guard let application = applicationCandidate,
-            application.processIdentifier != ProcessInfo.processInfo.processIdentifier
+    // The listener supplied an immutable foreground identity. Never pick a
+    // new application when a delayed capture eventually reaches the main actor.
+    func captureShortcutTarget(_ token: InputToken) -> Task<ShortcutTarget?, Never> {
+        pendingShortcut?.cancel()
+        guard lifetime.isCurrent(token),
+              let application = NSRunningApplication(processIdentifier: token.applicationPID),
+              token.applicationPID != ProcessInfo.processInfo.processIdentifier
         else { return Task { nil } }
-        let capturedGestureID = gestureID
-        return Task.detached(priority: .userInitiated) {
+        return Task { [weak self] in
+            guard let self else { return nil }
             let element = AXUIElementCreateApplication(application.processIdentifier)
-            AXUIElementSetMessagingTimeout(element, 0.03)
-            let window = focusedWindow(of: element)
-            if let window { AXUIElementSetMessagingTimeout(window, 0.03) }
+            let window = await self.readFocusedWindow(element, token: token)
+            guard self.lifetime.isCurrent(token), !Task.isCancelled else { return nil }
             windowLogger.notice("Shortcut captured application pid=\(application.processIdentifier) windowAvailable=\(window != nil)")
-            return ShortcutTarget(gestureID: capturedGestureID, application: application,
+            return ShortcutTarget(token: token, application: application,
                                   applicationElement: element, window: window)
+        }
+    }
+    private func readFocusedWindow(_ application: AXUIElement, token: InputToken) async -> AXUIElement? {
+        await withCheckedContinuation { continuation in
+            let lifetime = self.lifetime
+            axQueue.async {
+                guard lifetime.isCurrent(token) else { continuation.resume(returning: nil); return }
+                AXUIElementSetMessagingTimeout(application, 0.03)
+                let window = focusedWindow(of: application)
+                if let window { AXUIElementSetMessagingTimeout(window, 0.03) }
+                continuation.resume(returning: window)
+            }
         }
     }
 
@@ -63,7 +74,12 @@ final class ActionExecutor {
         windowController.restorePinnedWindows()
     }
 
-    func execute(_ action: GestureAction, gestureLocation: CGPoint, shortcutTarget: ShortcutTarget?) {
+    func execute(_ action: GestureAction, gestureLocation: CGPoint, shortcutTarget: ShortcutTarget?, token: InputToken) {
+        guard lifetime.isCurrent(token),
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == token.applicationPID else { return }
+        if action.kind != .copy && action.kind != .paste {
+            guard lifetime.claim(token) else { return }
+        }
         switch action.kind {
         case .none:
             break
@@ -99,7 +115,7 @@ final class ActionExecutor {
         }
         // A newer press or disabling gestures invalidates even an action that
         // was already queued by the previous mouse-up callback.
-        guard target.gestureID == gestureID else { return }
+        guard lifetime.isCurrent(target.token) else { return }
         pendingShortcut?.cancel()
         pendingShortcut = Task { @MainActor [weak self] in
             guard let self, !Task.isCancelled, !target.application.isTerminated else { return }
@@ -107,13 +123,16 @@ final class ActionExecutor {
             var stableWindow: AXUIElement?
             var stableSince = ProcessInfo.processInfo.systemUptime
             while !Task.isCancelled, !target.application.isTerminated {
-                guard target.gestureID == self.gestureID,
+                guard self.lifetime.isCurrent(target.token),
                     NSWorkspace.shared.frontmostApplication?.processIdentifier == target.application.processIdentifier
                 else {
                     windowLogger.notice("Shortcut cancelled: original application no longer active")
                     return
                 }
-                if let current = focusedWindow(of: target.applicationElement) {
+                guard ProcessInfo.processInfo.systemUptime <= deadline else { break }
+                if let current = await self.readFocusedWindow(target.applicationElement, token: target.token) {
+                    guard !Task.isCancelled, self.lifetime.isCurrent(target.token),
+                        ProcessInfo.processInfo.systemUptime <= deadline else { return }
                     let now = ProcessInfo.processInfo.systemUptime
                     if stableWindow == nil || !CFEqual(stableWindow!, current) {
                         stableWindow = current
@@ -122,7 +141,8 @@ final class ActionExecutor {
                     let capturedMatches = target.window.map { CFEqual($0, current) }
                     if ClipboardFocusPolicy.canSend(originalPID: target.application.processIdentifier,
                         currentPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
-                        capturedWindowMatches: capturedMatches, recoveredWindowStable: now - stableSince >= 0.03) {
+                        capturedWindowMatches: capturedMatches, recoveredWindowStable: now - stableSince >= 0.03),
+                        self.lifetime.claim(target.token) {
                         self.postShortcut(keyCode: keyCode, modifiers: .maskCommand,
                                           targetPID: target.application.processIdentifier)
                         windowLogger.notice("Shortcut sent after focus confirmation pid=\(target.application.processIdentifier) key=\(keyCode) recoveredWindow=\(target.window == nil)")

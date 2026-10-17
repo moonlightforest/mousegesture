@@ -19,6 +19,10 @@ let package = Package(
         .testTarget(
             name: "MouseGestureCoreTests",
             dependencies: ["MouseGestureCore"]
+        ),
+        .testTarget(
+            name: "MouseGestureAppTests",
+            dependencies: ["MouseGestureApp"]
         )
     ],
     swiftLanguageModes: [.v5]

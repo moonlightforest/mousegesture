@@ -10,7 +10,11 @@ private let appLogger = Logger(subsystem: "com.yaoyinliang.MouseGesture", catego
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let store = SettingsStore()
-    private let executor = ActionExecutor()
+    private let lifetime = InputLifetime()
+    private lazy var executor = ActionExecutor(lifetime: lifetime)
+    private var listenerStatus: InputListenerStatus = .paused
+    private var listenerStatusItem: NSMenuItem?
+    private var recoverItem: NSMenuItem?
     var settingsContent: SettingsView { SettingsView(store: store) }
     private var statusItem: NSStatusItem?
     private var settingsWindow: NSWindow?
@@ -21,26 +25,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var cancellable: AnyCancellable?
     private var appActivationObserver: NSObjectProtocol?
 
-    private lazy var engine = GestureEngine(captureShortcutTarget: { [weak self] in
-        // GestureEngine's event source is installed on CFRunLoopGetMain().
-        MainActor.assumeIsolated {
+    private lazy var engine = GestureEngine(lifetime: lifetime,
+        captureShortcutTarget: { [weak self] token in
             guard let self else { return Task { nil } }
-            return self.executor.captureShortcutTarget()
-        }
-    }) { [weak self] direction, location, target in
-        guard let self else { return }
-        let action = self.store.action(for: direction)
-        self.executor.execute(action, gestureLocation: location, shortcutTarget: target)
+            return self.executor.captureShortcutTarget(token)
+        }, actionHandler: { [weak self] direction, location, target, token in
+            guard let self else { return }
+            let action = self.store.action(for: direction)
+            self.executor.execute(action, gestureLocation: location, shortcutTarget: target, token: token)
+        }, statusHandler: { [weak self] status in
+            guard let self else { return }
+            self.listenerStatus = status
+            if case .faulted = status { self.executor.cancelPendingShortcut() }
+            self.refreshMenuState()
+        })
+
+    private func updateForegroundSnapshot() {
+        let front = NSWorkspace.shared.frontmostApplication
+        let application = (front?.processIdentifier ?? -1) > 0 ? front
+            : NSWorkspace.shared.runningApplications.first { $0.isActive && $0.processIdentifier > 0 }
+        engine.foregroundChanged(to: application?.processIdentifier ?? -1)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        appLogger.notice("Gesture input revision 11: late vertical motion and same-app focus recovery")
+        appLogger.notice("Gesture input revision 16: pre-press recovery only for replayed strokes")
         appLogger.notice(
             "Permissions accessibility=\(AccessibilityPermission.isGranted) screenRecording=\(ScreenRecordingPermission.isGranted)"
         )
         NSApp.setActivationPolicy(.accessory)
         setUpStatusItem()
         observeSettings()
+        updateForegroundSnapshot()
         syncEngine()
         appActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
@@ -48,6 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
+                self?.updateForegroundSnapshot()
                 self?.syncEngine()
             }
         }
@@ -61,13 +77,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let appActivationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(appActivationObserver)
         }
-        engine.stop()
+        engine.shutdown()
         executor.restoreWindowLevels()
     }
 
     func menuWillOpen(_ menu: NSMenu) {
         refreshMenuState()
-        if AccessibilityPermission.isGranted { _ = engine.start() }
+        syncEngine()
     }
 
     private func setUpStatusItem() {
@@ -87,6 +103,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let title = NSMenuItem(title: "鼠标手势", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
+        let state = NSMenuItem(title: "手势已暂停", action: nil, keyEquivalent: "")
+        state.isEnabled = false
+        menu.addItem(state)
+        listenerStatusItem = state
+        let recover = NSMenuItem(title: "恢复手势监听", action: #selector(recoverListener), keyEquivalent: "")
+        recover.target = self
+        menu.addItem(recover)
+        recoverItem = recover
 
         let enabled = NSMenuItem(title: "已启用", action: #selector(toggleEnabled), keyEquivalent: "")
         enabled.target = self
@@ -138,8 +162,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cancellable = store.$configuration
             .dropFirst()
             .sink { [weak self] _ in
-                self?.syncEngine()
-                self?.refreshMenuState()
+                // @Published emits before the stored configuration changes.
+                DispatchQueue.main.async {
+                    self?.syncEngine()
+                    self?.refreshMenuState()
+                }
             }
     }
 
@@ -149,16 +176,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             enabled: store.configuration.enabled,
             threshold: CGFloat(store.configuration.threshold)
         )
-        if store.configuration.enabled, AccessibilityPermission.isGranted {
-            _ = engine.start()
+        if store.configuration.enabled {
+            engine.start()
         }
     }
 
     private func refreshMenuState() {
-        enabledItem?.state = store.configuration.enabled ? .on : .off
+        let message: String
+        switch listenerStatus {
+        case .running: message = "手势正常"
+        case .paused: message = "手势已暂停"
+        case .faulted: message = "手势已暂停：输入监听异常"
+        case .permissionMissing: message = "手势已暂停：需要辅助功能权限"
+        }
+        listenerStatusItem?.title = message
+        statusItem?.button?.toolTip = "MouseGesture · " + message
+        recoverItem?.isHidden = listenerStatus != .faulted
+        enabledItem?.state = listenerStatus == .running ? .on : .off
         permissionItem?.state = AccessibilityPermission.isGranted ? .on : .off
         screenRecordingItem?.state = ScreenRecordingPermission.isGranted ? .on : .off
         launchAtLoginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    }
+
+    @objc private func recoverListener() {
+        guard AccessibilityPermission.isGranted else { openAccessibilityPermission(); return }
+        executor.cancelPendingShortcut()
+        updateForegroundSnapshot()
+        store.configuration.enabled = true
+        engine.recover()
     }
 
     @objc private func toggleEnabled() {
