@@ -19,6 +19,7 @@ final class GestureFeedbackOverlay {
 
     private var panel: NSPanel?
     private var label: NSTextField?
+    private var background: NSView?
     private var hideWork: DispatchWorkItem?
     private var generation = 0
 
@@ -33,20 +34,21 @@ final class GestureFeedbackOverlay {
     func show(_ text: String, style: Style, placement: Placement, at location: CGPoint) {
         let (panel, label) = makePanelIfNeeded()
         label.attributedStringValue = NSAttributedString(string: text, attributes: [.shadow: Self.textShadow])
-        // Small and faint: a confirmation, not a notification.
-        label.font = .systemFont(ofSize: style == .recognized ? 9 : 11, weight: .medium)
+        // Small and quiet: a confirmation, not a notification.
+        label.font = .systemFont(ofSize: style == .recognized ? 12 : 13, weight: .medium)
         // Neutral gray on the adaptive material reads on light and dark pages
         // alike; the rejected and pause hints stay a little fainter.
         label.textColor = .secondaryLabelColor
         label.alphaValue = style == .recognized ? 1 : 0.73
         label.sizeToFit()
 
-        let size = CGSize(width: max(label.frame.width + 12, 22), height: max(label.frame.height + 6, 18))
+        let size = CGSize(width: max(label.frame.width + 20, 30), height: max(label.frame.height + 10, 24))
         let screen = NSScreen.screens.first { NSMouseInRect(location, $0.frame, false) } ?? NSScreen.main
         let visible = screen?.visibleFrame ?? CGRect(origin: .zero, size: CGSize(width: 1e6, height: 1e6))
         panel.setFrame(Self.frame(size: size, cursor: location, placement: placement, visible: visible), display: false)
         label.frame.origin = CGPoint(x: (size.width - label.frame.width) / 2,
                                      y: (size.height - label.frame.height) / 2)
+        setCornerRadius(size.height / 2)
 
         hideWork?.cancel()
         generation += 1
@@ -98,6 +100,14 @@ final class GestureFeedbackOverlay {
         return shadow
     }()
 
+    private func setCornerRadius(_ radius: CGFloat) {
+        if #available(macOS 26.0, *), let glass = background as? NSGlassEffectView {
+            glass.cornerRadius = radius
+        } else {
+            background?.layer?.cornerRadius = radius
+        }
+    }
+
     private func makePanelIfNeeded() -> (NSPanel, NSTextField) {
         if let panel, let label { return (panel, label) }
         let panel = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 80, height: 36),
@@ -114,24 +124,32 @@ final class GestureFeedbackOverlay {
         panel.animationBehavior = .none
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle, .transient]
 
-        let content = NSView()
-        panel.contentView = content
-        let background = NSVisualEffectView()
-        // Follows the system appearance, unlike the always-dark HUD material.
-        background.material = .toolTip
-        background.blendingMode = .behindWindow
-        background.state = .active
-        background.wantsLayer = true
-        background.layer?.cornerRadius = 5
-        background.layer?.masksToBounds = true
-        background.autoresizingMask = [.width, .height]
-        background.frame = content.bounds
-        content.addSubview(background)
-
-        // A sibling of the background so the text keeps its own opacity.
         let label = NSTextField(labelWithString: "")
         label.alignment = .center
-        content.addSubview(label)
+        let background: NSView
+        if #available(macOS 26.0, *) {
+            // Liquid Glass: clear and adaptive. The label lives inside the
+            // glass so the system keeps it legible over any content.
+            let glass = NSGlassEffectView()
+            glass.style = .clear
+            let content = NSView()
+            content.addSubview(label)
+            glass.contentView = content
+            background = glass
+        } else {
+            let effect = NSVisualEffectView()
+            // Follows the system appearance, unlike the always-dark HUD material.
+            effect.material = .toolTip
+            effect.blendingMode = .behindWindow
+            effect.state = .active
+            effect.wantsLayer = true
+            effect.layer?.masksToBounds = true
+            // A sibling of the material so the text keeps its own opacity.
+            effect.addSubview(label)
+            background = effect
+        }
+        panel.contentView = background
+        self.background = background
 
         self.panel = panel
         self.label = label
