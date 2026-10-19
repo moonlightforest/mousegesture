@@ -4,6 +4,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var store: SettingsStore
+    @State private var showingToggleRecorder = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -30,9 +31,42 @@ struct SettingsView: View {
             Text("按住右键移动达到阈值并释放后执行动作。四个方向使用相同的阈值，各自接受偏离方向左右 \(Int(GestureClassifier.sectorHalfAngle))° 以内的移动；斜向夹在两个方向之间时不触发。")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+
+            Divider()
+
+            Toggle("识别后在起点附近显示提示", isOn: showsFeedbackBinding)
+
+            HStack(spacing: 14) {
+                Text("暂停/启用快捷键")
+                Button(ShortcutFormatter.display(store.configuration.toggleShortcut) ?? "录制…") {
+                    showingToggleRecorder = true
+                }
+                .sheet(isPresented: $showingToggleRecorder) {
+                    ShortcutRecorderSheet(
+                        initialShortcut: store.configuration.toggleShortcut,
+                        isPresented: $showingToggleRecorder
+                    ) { store.configuration.toggleShortcut = $0 }
+                }
+                if store.configuration.toggleShortcut != GestureConfiguration.defaultToggleShortcut {
+                    Button("恢复默认") {
+                        store.configuration.toggleShortcut = GestureConfiguration.defaultToggleShortcut
+                    }
+                }
+            }
+
+            Divider()
+
+            ExcludedApplicationsSection(store: store)
         }
         .padding(24)
         .frame(width: 560)
+    }
+
+    private var showsFeedbackBinding: Binding<Bool> {
+        Binding(
+            get: { store.configuration.showsFeedback },
+            set: { store.configuration.showsFeedback = $0 }
+        )
     }
 
     private var thresholdBinding: Binding<Double> {
@@ -219,7 +253,7 @@ private final class CaptureNSView: NSView {
     }
 }
 
-private enum ShortcutFormatter {
+enum ShortcutFormatter {
     static func display(_ shortcut: RecordedShortcut?) -> String? {
         guard let shortcut else { return nil }
         let flags = NSEvent.ModifierFlags(rawValue: UInt(shortcut.modifierRawValue))
@@ -243,5 +277,67 @@ private enum ShortcutFormatter {
             49: "Space", 50: "`", 51: "⌫", 53: "⎋", 123: "←", 124: "→", 125: "↓", 126: "↑"
         ]
         return names[keyCode] ?? "Key \(keyCode)"
+    }
+}
+
+/// Applications in which right-button input is passed through untouched.
+private struct ExcludedApplicationsSection: View {
+    @ObservedObject var store: SettingsStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("停用手势的应用")
+                Spacer()
+                Button("添加应用…", action: addApplication)
+            }
+            if store.configuration.excludedBundleIdentifiers.isEmpty {
+                Text("这些应用在前台时，右键保持原样，不识别手势。也可以在菜单栏选择“在「应用名」中停用手势”。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(store.configuration.excludedBundleIdentifiers, id: \.self) { bundleIdentifier in
+                    HStack(spacing: 8) {
+                        Image(nsImage: Self.icon(for: bundleIdentifier))
+                            .resizable()
+                            .frame(width: 18, height: 18)
+                        Text(Self.name(for: bundleIdentifier))
+                        Spacer()
+                        Button("移除") {
+                            store.configuration.setExcluded(false, bundleIdentifier: bundleIdentifier)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func addApplication() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowsMultipleSelection = true
+        panel.prompt = "停用手势"
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls {
+            guard let bundleIdentifier = Bundle(url: url)?.bundleIdentifier else { continue }
+            store.configuration.setExcluded(true, bundleIdentifier: bundleIdentifier)
+        }
+    }
+
+    private static func applicationURL(for bundleIdentifier: String) -> URL? {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
+    }
+
+    private static func name(for bundleIdentifier: String) -> String {
+        guard let url = applicationURL(for: bundleIdentifier) else { return bundleIdentifier }
+        return FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
+    }
+
+    private static func icon(for bundleIdentifier: String) -> NSImage {
+        guard let url = applicationURL(for: bundleIdentifier) else {
+            return NSImage(systemSymbolName: "app", accessibilityDescription: nil) ?? NSImage()
+        }
+        return NSWorkspace.shared.icon(forFile: url.path)
     }
 }

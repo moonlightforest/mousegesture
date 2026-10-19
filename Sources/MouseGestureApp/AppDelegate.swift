@@ -17,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var listenerStatusItem: NSMenuItem?
     private var recoverItem: NSMenuItem?
     private var replayWarningItem: NSMenuItem?
+    private var excludeItem: NSMenuItem?
     private var replayWarning = false
     var settingsContent: SettingsView { SettingsView(store: store) }
     private var statusItem: NSStatusItem?
@@ -27,15 +28,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var launchAtLoginItem: NSMenuItem?
     private var cancellable: AnyCancellable?
     private var appActivationObserver: NSObjectProtocol?
+    private let feedback = GestureFeedbackOverlay()
+    private lazy var toggleHotKey = GlobalHotKey { [weak self] in self?.toggleFromShortcut() }
 
     private lazy var engine = GestureEngine(lifetime: lifetime,
         captureShortcutTarget: { [weak self] token in
             guard let self else { return Task { nil } }
             return self.executor.captureShortcutTarget(token)
-        }, actionHandler: { [weak self] direction, location, target, token in
+        }, actionHandler: { [weak self] direction, location, releaseLocation, target, token in
             guard let self else { return }
             let action = self.store.action(for: direction)
             self.executor.execute(action, gestureLocation: location, shortcutTarget: target, token: token)
+            if self.store.configuration.showsFeedback {
+                self.feedback.show("\(direction.symbol) \(action.kind.displayName)",
+                                   style: action.kind == .none ? .rejected : .recognized,
+                                   placement: direction == .up || direction == .down ? .beside : .below,
+                                   atQuartz: releaseLocation)
+            }
         }, statusHandler: { [weak self] status in
             guard let self else { return }
             self.listenerStatus = status
@@ -43,6 +52,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.refreshMenuState()
         }, replayHandler: { [weak self] change in
             self?.handleReplayedInput(change)
+        }, rejectionHandler: { [weak self] location, horizontal in
+            MainActor.assumeIsolated {
+                guard let self, self.store.configuration.showsFeedback else { return }
+                self.feedback.show("✕", style: .rejected, placement: horizontal ? .below : .beside, atQuartz: location)
+            }
         })
 
     private func updateForegroundSnapshot() {
@@ -53,7 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        appLogger.notice("Gesture input revision 17: uniform sectors, stable signing, replay warning")
+        appLogger.notice("Gesture input revision 19: per-app exclusion, pin mirror only when covered")
         appLogger.notice(
             "Permissions accessibility=\(AccessibilityPermission.isGranted) screenRecording=\(ScreenRecordingPermission.isGranted)"
         )
@@ -62,6 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         observeSettings()
         updateForegroundSnapshot()
         syncEngine()
+        toggleHotKey.register(store.configuration.toggleShortcut)
         appActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
@@ -82,6 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let appActivationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(appActivationObserver)
         }
+        toggleHotKey.unregister()
         engine.shutdown()
         executor.restoreWindowLevels()
     }
@@ -126,6 +142,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         enabled.target = self
         menu.addItem(enabled)
         enabledItem = enabled
+
+        let exclude = NSMenuItem(title: "在当前应用中停用手势", action: #selector(toggleFrontmostExclusion),
+                                 keyEquivalent: "")
+        exclude.target = self
+        menu.addItem(exclude)
+        excludeItem = exclude
 
         let gestures = NSMenuItem(title: "手势设置…", action: #selector(showSettings), keyEquivalent: ",")
         gestures.target = self
@@ -174,14 +196,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .sink { [weak self] _ in
                 // @Published emits before the stored configuration changes.
                 DispatchQueue.main.async {
-                    self?.syncEngine()
-                    self?.refreshMenuState()
+                    guard let self else { return }
+                    self.syncEngine()
+                    self.toggleHotKey.register(self.store.configuration.toggleShortcut)
+                    self.refreshMenuState()
                 }
             }
     }
 
     private func syncEngine() {
         if !store.configuration.enabled { executor.cancelPendingShortcut() }
+        engine.setForegroundExcluded(
+            store.configuration.excludes(bundleIdentifier: NSWorkspace.shared.frontmostApplication?.bundleIdentifier))
         engine.update(
             enabled: store.configuration.enabled,
             threshold: CGFloat(store.configuration.threshold)
@@ -203,7 +229,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem?.button?.toolTip = "MouseGesture · " + message
         recoverItem?.isHidden = listenerStatus != .faulted
         replayWarningItem?.isHidden = !replayWarning
+        // The menu bar app never activates, so the frontmost app is the user's.
+        let front = NSWorkspace.shared.frontmostApplication
+        let frontName = front?.localizedName ?? "当前应用"
+        excludeItem?.title = "在「\(frontName)」中停用手势"
+        excludeItem?.isEnabled = front?.bundleIdentifier != nil
+        excludeItem?.state = store.configuration.excludes(bundleIdentifier: front?.bundleIdentifier) ? .on : .off
         enabledItem?.state = listenerStatus == .running ? .on : .off
+        enabledItem?.title = "已启用（" + (ShortcutFormatter.display(store.configuration.toggleShortcut) ?? "") + "）"
         permissionItem?.state = AccessibilityPermission.isGranted ? .on : .off
         screenRecordingItem?.state = ScreenRecordingPermission.isGranted ? .on : .off
         launchAtLoginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -235,6 +268,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc private func toggleFrontmostExclusion() {
+        guard let bundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return }
+        let excluded = store.configuration.excludes(bundleIdentifier: bundleIdentifier)
+        store.configuration.setExcluded(!excluded, bundleIdentifier: bundleIdentifier)
+        appLogger.notice("Gesture exclusion \(excluded ? "removed" : "added", privacy: .public) for \(bundleIdentifier, privacy: .public)")
+    }
+
     @objc private func recoverListener() {
         guard AccessibilityPermission.isGranted else { openAccessibilityPermission(); return }
         executor.cancelPendingShortcut()
@@ -247,10 +287,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         store.configuration.enabled.toggle()
     }
 
+    private func toggleFromShortcut() {
+        store.configuration.enabled.toggle()
+        let enabled = store.configuration.enabled
+        appLogger.notice("Gestures \(enabled ? "enabled" : "paused", privacy: .public) by toggle shortcut")
+        // Always confirm the toggle, even when gesture hints are off.
+        feedback.show(enabled ? "手势已启用" : "手势已暂停", style: enabled ? .recognized : .rejected,
+                      placement: .beside, at: NSEvent.mouseLocation)
+    }
+
     @objc private func showSettings() {
         if settingsWindow == nil {
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 560, height: 390),
+                contentRect: NSRect(x: 0, y: 0, width: 560, height: 470),
                 styleMask: [.titled, .closable],
                 backing: .buffered,
                 defer: false

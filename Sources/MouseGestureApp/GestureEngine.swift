@@ -52,24 +52,34 @@ final class GestureEngine {
     private var replayMonitor = ReplayedInputMonitor()
     private var rightPressCaptured = false
     private var enabled = true
+    /// The frontmost application is excluded: right-button input passes through.
+    private var foregroundExcluded = false
     private var inputFaulted = false
     private var threshold: CGFloat = 40
     private var nextRightClickEventNumber: Int64 = 0
     private let captureShortcutTarget: @MainActor (InputToken) -> Task<ShortcutTarget?, Never>
-    private let actionHandler: @MainActor (GestureDirection, CGPoint, ShortcutTarget?, InputToken) -> Void
+    /// Receives the direction, the stroke start (where actions apply) and the
+    /// release point (where feedback is shown).
+    private let actionHandler: @MainActor (GestureDirection, CGPoint, CGPoint, ShortcutTarget?, InputToken) -> Void
     private let statusHandler: (InputListenerStatus) -> Void
     private let replayHandler: (ReplayedInputMonitor.Change) -> Void
+    /// Receives the release point of a stroke that moved past the threshold
+    /// without matching a direction, and whether it moved mostly
+    /// horizontally. Always called on the main queue.
+    private let rejectionHandler: (CGPoint, Bool) -> Void
 
     init(lifetime: InputLifetime,
          captureShortcutTarget: @escaping @MainActor (InputToken) -> Task<ShortcutTarget?, Never>,
-         actionHandler: @escaping @MainActor (GestureDirection, CGPoint, ShortcutTarget?, InputToken) -> Void,
+         actionHandler: @escaping @MainActor (GestureDirection, CGPoint, CGPoint, ShortcutTarget?, InputToken) -> Void,
          statusHandler: @escaping (InputListenerStatus) -> Void,
-         replayHandler: @escaping (ReplayedInputMonitor.Change) -> Void = { _ in }) {
+         replayHandler: @escaping (ReplayedInputMonitor.Change) -> Void = { _ in },
+         rejectionHandler: @escaping (CGPoint, Bool) -> Void = { _, _ in }) {
         self.lifetime = lifetime
         self.captureShortcutTarget = captureShortcutTarget
         self.actionHandler = actionHandler
         self.statusHandler = statusHandler
         self.replayHandler = replayHandler
+        self.rejectionHandler = rejectionHandler
     }
 
     func update(enabled: Bool, threshold: CGFloat) {
@@ -84,6 +94,9 @@ final class GestureEngine {
     func foregroundChanged(to pid: Int32) {
         guard lifetime.foregroundChanged(to: pid) else { return }
         inputLoop.perform { [weak self] in self?.tracking = nil; self?.recentMotion.removeAll() }
+    }
+    func setForegroundExcluded(_ excluded: Bool) {
+        inputLoop.perform { [weak self] in self?.foregroundExcluded = excluded }
     }
     func recover() {
         lifetime.recover()
@@ -195,6 +208,11 @@ final class GestureEngine {
             return Unmanaged.passUnretained(event)
 
         case .rightMouseDown:
+            // Drags and the release follow because nothing was captured.
+            guard !foregroundExcluded else {
+                tracking = nil
+                return Unmanaged.passUnretained(event)
+            }
             rightPressCaptured = true
             let token = lifetime.begin()
             let prePressMotion = recentMotion.samples
@@ -233,6 +251,7 @@ final class GestureEngine {
                 return intercepted ? nil : Unmanaged.passUnretained(event)
             }
             let releasedAt = ProcessInfo.processInfo.systemUptime
+            let releaseLocation = event.location
             let coordinateDirection = completed.stroke.direction(threshold: currentThreshold)
             let prePressDirection = PrePressGesture.direction(
                 before: completed.prePressMotion, pressedAt: completed.startedAt, press: completed.stroke.start,
@@ -262,11 +281,13 @@ final class GestureEngine {
                 Task { @MainActor [actionHandler, lifetime] in
                     let target = await completed.shortcutTarget.value
                     guard lifetime.isCurrent(completed.token) else { return }
-                    actionHandler(direction, completed.stroke.start, target, completed.token)
+                    actionHandler(direction, completed.stroke.start, releaseLocation, target, completed.token)
                 }
             } else {
                 if hypot(coordinateOffset.x, coordinateOffset.y) >= currentThreshold {
                     diagnosticsQueue.async { gestureLogger.notice("Unassigned diagonal drag suppressed; no right-click replay") }
+                    let horizontal = abs(coordinateOffset.x) >= abs(coordinateOffset.y)
+                    DispatchQueue.main.async { [rejectionHandler] in rejectionHandler(releaseLocation, horizontal) }
                     return nil
                 }
                 // Posting into the HID stream from this synchronous event-tap

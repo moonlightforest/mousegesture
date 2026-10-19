@@ -60,16 +60,61 @@ public struct GestureConfiguration: Codable, Equatable, Sendable {
     public var enabled: Bool
     public var threshold: Double
     public var actions: [GestureDirection: GestureAction]
+    /// Show a brief hint near the stroke once a gesture is recognized.
+    public var showsFeedback: Bool
+    /// Global shortcut that toggles `enabled`.
+    public var toggleShortcut: RecordedShortcut
+    /// Bundle identifiers of applications in which right-button input is
+    /// left untouched while they are frontmost.
+    public var excludedBundleIdentifiers: [String]
 
     public init(
         enabled: Bool = true,
         threshold: Double = 40,
-        actions: [GestureDirection: GestureAction] = Self.betterTouchToolDefaults
+        actions: [GestureDirection: GestureAction] = Self.betterTouchToolDefaults,
+        showsFeedback: Bool = true,
+        toggleShortcut: RecordedShortcut = Self.defaultToggleShortcut,
+        excludedBundleIdentifiers: [String] = []
     ) {
         self.enabled = enabled
         self.threshold = threshold
         self.actions = actions
+        self.showsFeedback = showsFeedback
+        self.toggleShortcut = toggleShortcut
+        self.excludedBundleIdentifiers = excludedBundleIdentifiers
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled, threshold, actions, showsFeedback, toggleShortcut, excludedBundleIdentifiers
+    }
+
+    /// Fields added after the first release fall back to their defaults so
+    /// saved configurations keep loading.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decode(Bool.self, forKey: .enabled)
+        threshold = try container.decode(Double.self, forKey: .threshold)
+        actions = try container.decode([GestureDirection: GestureAction].self, forKey: .actions)
+        showsFeedback = try container.decodeIfPresent(Bool.self, forKey: .showsFeedback) ?? true
+        toggleShortcut = try container.decodeIfPresent(RecordedShortcut.self, forKey: .toggleShortcut)
+            ?? Self.defaultToggleShortcut
+        excludedBundleIdentifiers = try container.decodeIfPresent(
+            [String].self, forKey: .excludedBundleIdentifiers) ?? []
+    }
+
+    public func excludes(bundleIdentifier: String?) -> Bool {
+        guard let bundleIdentifier else { return false }
+        return excludedBundleIdentifiers.contains(bundleIdentifier)
+    }
+
+    public mutating func setExcluded(_ excluded: Bool, bundleIdentifier: String) {
+        excludedBundleIdentifiers.removeAll { $0 == bundleIdentifier }
+        if excluded { excludedBundleIdentifiers.append(bundleIdentifier) }
+    }
+
+    /// ⌃⌥⌘G, stored with `NSEvent.ModifierFlags` raw values like recorded shortcuts.
+    public static let defaultToggleShortcut = RecordedShortcut(
+        keyCode: 5, modifierRawValue: (1 << 18) | (1 << 19) | (1 << 20))
 
     public static let betterTouchToolDefaults: [GestureDirection: GestureAction] = [
         .up: GestureAction(kind: .copy),
