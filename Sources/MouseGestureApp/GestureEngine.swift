@@ -14,45 +14,31 @@ final class GestureEngine {
 
     private struct TrackingState {
         var stroke: GestureStroke
-        var shortVerticalStroke: ShortVerticalStroke
         let thresholdAtMouseDown: CGFloat
-        var firstCommittedDirection: GestureDirection?
-        var relativeStroke = GestureStroke(start: .zero)
-        var relativePosition = CGPoint.zero
         let token: InputToken
         let shortcutTarget: Task<ShortcutTarget?, Never>
         let startedAt = ProcessInfo.processInfo.systemUptime
         let prePressMotion: [MotionSample]
+        /// Posted by another process, such as Deskflow, rather than the HID system.
+        let remoteSource: Bool
         var dragPoints: [CGPoint] = []
         var dragCount = 0
         var moveCount = 0
 
         init(start: CGPoint, threshold: CGFloat, token: InputToken, shortcutTarget: Task<ShortcutTarget?, Never>,
-             prePressMotion: [MotionSample]) {
+             prePressMotion: [MotionSample], remoteSource: Bool) {
             self.prePressMotion = prePressMotion
+            self.remoteSource = remoteSource
             stroke = GestureStroke(start: start)
-            shortVerticalStroke = ShortVerticalStroke(start: start)
             thresholdAtMouseDown = threshold
             self.token = token
             self.shortcutTarget = shortcutTarget
         }
 
-        mutating func record(_ event: CGEvent) {
-            stroke.record(event.location)
-            relativePosition.x += CGFloat(event.getIntegerValueField(.mouseEventDeltaX))
-            relativePosition.y += CGFloat(event.getIntegerValueField(.mouseEventDeltaY))
-            relativeStroke.record(relativePosition)
-        }
-
         mutating func recordDrag(_ event: CGEvent) {
-            record(event)
-            shortVerticalStroke.recordDrag(event.location)
+            stroke.record(event.location)
             if dragPoints.count < 256 { dragPoints.append(event.location) }
             dragCount += 1
-            if firstCommittedDirection == nil, dragCount >= 2 {
-                firstCommittedDirection = GestureClassifier(threshold: thresholdAtMouseDown)
-                    .direction(from: stroke.start, to: event.location)
-            }
         }
     }
 
@@ -63,6 +49,7 @@ final class GestureEngine {
     private var runLoopSource: CFRunLoopSource?
     private var tracking: TrackingState?
     private var recentMotion = RecentMotion()
+    private var replayMonitor = ReplayedInputMonitor()
     private var rightPressCaptured = false
     private var enabled = true
     private var inputFaulted = false
@@ -71,15 +58,18 @@ final class GestureEngine {
     private let captureShortcutTarget: @MainActor (InputToken) -> Task<ShortcutTarget?, Never>
     private let actionHandler: @MainActor (GestureDirection, CGPoint, ShortcutTarget?, InputToken) -> Void
     private let statusHandler: (InputListenerStatus) -> Void
+    private let replayHandler: (ReplayedInputMonitor.Change) -> Void
 
     init(lifetime: InputLifetime,
          captureShortcutTarget: @escaping @MainActor (InputToken) -> Task<ShortcutTarget?, Never>,
          actionHandler: @escaping @MainActor (GestureDirection, CGPoint, ShortcutTarget?, InputToken) -> Void,
-         statusHandler: @escaping (InputListenerStatus) -> Void) {
+         statusHandler: @escaping (InputListenerStatus) -> Void,
+         replayHandler: @escaping (ReplayedInputMonitor.Change) -> Void = { _ in }) {
         self.lifetime = lifetime
         self.captureShortcutTarget = captureShortcutTarget
         self.actionHandler = actionHandler
         self.statusHandler = statusHandler
+        self.replayHandler = replayHandler
     }
 
     func update(enabled: Bool, threshold: CGFloat) {
@@ -214,7 +204,8 @@ final class GestureEngine {
                 return await captureShortcutTarget(token).value
             }
             tracking = TrackingState(start: event.location, threshold: threshold, token: token, shortcutTarget: target,
-                                     prePressMotion: prePressMotion)
+                                     prePressMotion: prePressMotion,
+                                     remoteSource: event.getIntegerValueField(.eventSourceUnixProcessID) != 0)
             return nil
 
         case .rightMouseDragged:
@@ -223,8 +214,7 @@ final class GestureEngine {
 
         case .mouseMoved:
             if tracking != nil {
-                tracking?.record(event)
-                tracking?.shortVerticalStroke.recordDrag(event.location)
+                tracking?.stroke.record(event.location)
                 tracking?.moveCount += 1
             } else {
                 recentMotion.record(event.location, at: ProcessInfo.processInfo.systemUptime)
@@ -235,52 +225,37 @@ final class GestureEngine {
             let intercepted = rightPressCaptured
             rightPressCaptured = false
             var completed = tracking
-            completed?.record(event)
-            completed?.shortVerticalStroke.recordDrag(event.location)
+            completed?.stroke.record(event.location)
             tracking = nil
             let currentThreshold = threshold
 
             guard let completed, lifetime.isCurrent(completed.token) else {
                 return intercepted ? nil : Unmanaged.passUnretained(event)
             }
-            let originalCoordinateDirection = completed.stroke.direction(threshold: currentThreshold)
-            let coordinateDirection = completed.stroke.direction(
-                threshold: currentThreshold, preferring: completed.firstCommittedDirection
-            )
-            let relativeDirection = completed.relativeStroke.direction(threshold: currentThreshold)
-            let shortVerticalDirection = completed.shortVerticalStroke.direction(threshold: currentThreshold)
+            let releasedAt = ProcessInfo.processInfo.systemUptime
+            let coordinateDirection = completed.stroke.direction(threshold: currentThreshold)
             let prePressDirection = PrePressGesture.direction(
                 before: completed.prePressMotion, pressedAt: completed.startedAt, press: completed.stroke.start,
                 drags: completed.dragPoints, release: event.location,
-                releasedAt: ProcessInfo.processInfo.systemUptime, threshold: currentThreshold
+                releasedAt: releasedAt, threshold: currentThreshold
             )
             let prePressOffset = completed.prePressMotion.first.map {
                 CGPoint(x: completed.stroke.start.x - $0.point.x, y: completed.stroke.start.y - $0.point.y)
             } ?? .zero
             let pressGapMs = completed.prePressMotion.last.map { Int((completed.startedAt - $0.time) * 1_000) } ?? -1
             let coordinateOffset = completed.stroke.furthestDisplacement
-            let axisPeak = completed.stroke.axisPeakDisplacement
-            let relativeOffset = completed.relativeStroke.furthestDisplacement
-            // A native device may report the opposite sign for relative Y.
-            // Use the delta fallback only when the cursor's smaller movement
-            // confirms the same dominant direction.
-            let deltaIsAligned: Bool
-            switch relativeDirection {
-            case .up: deltaIsAligned = coordinateOffset.y < -1 && abs(coordinateOffset.y) >= abs(coordinateOffset.x)
-            case .down: deltaIsAligned = coordinateOffset.y > 1 && GestureClassifier.isWithinDownSector(dx: coordinateOffset.x, dy: coordinateOffset.y)
-            case .left: deltaIsAligned = coordinateOffset.x < -1 && abs(coordinateOffset.x) >= abs(coordinateOffset.y)
-            case .right: deltaIsAligned = coordinateOffset.x > 1 && GestureClassifier(threshold: 1).direction(from: .zero, to: coordinateOffset) == .right
-            case nil: deltaIsAligned = false
+            // Pre-press recovery only answers for replayed strokes; a real
+            // press is judged by its own movement.
+            let direction = prePressDirection ?? coordinateDirection
+            let decisionPath = prePressDirection != nil ? "pre-press" : (coordinateDirection != nil ? "coordinate" : "none")
+            let durationMs = Int((releasedAt - completed.startedAt) * 1_000)
+            if let change = replayMonitor.record(hold: releasedAt - completed.startedAt,
+                                                 remoteSource: completed.remoteSource, at: releasedAt) {
+                DispatchQueue.main.async { [replayHandler] in replayHandler(change) }
             }
-            let deltaDirection = deltaIsAligned ? relativeDirection : nil
-            let direction = prePressDirection ?? coordinateDirection ?? deltaDirection ?? shortVerticalDirection
-            let decisionPath = prePressDirection != nil ? "pre-press" : coordinateDirection != nil
-                ? (coordinateDirection == originalCoordinateDirection ? "coordinate" : "first-direction")
-                : (deltaDirection != nil ? "delta" : (shortVerticalDirection != nil ? "short-vertical" : "none"))
-            let durationMs = Int((ProcessInfo.processInfo.systemUptime - completed.startedAt) * 1_000)
             diagnosticsQueue.async {
             gestureLogger.notice(
-                "Right gesture direction=\(direction?.rawValue ?? "none", privacy: .public) path=\(decisionPath, privacy: .public) threshold=\(Int(currentThreshold)) shortThreshold=\(Int(ShortVerticalStroke.minimumDistance(for: currentThreshold))) start=(\(Int(completed.stroke.start.x)),\(Int(completed.stroke.start.y))) coord=(\(Int(coordinateOffset.x)),\(Int(coordinateOffset.y))) axisPeak=(\(Int(axisPeak.x)),\(Int(axisPeak.y))) first=\(completed.firstCommittedDirection?.rawValue ?? "none", privacy: .public) delta=(\(Int(relativeOffset.x)),\(Int(relativeOffset.y))) durationMs=\(durationMs) drags=\(completed.dragCount) moves=\(completed.moveCount) prePress=(\(Int(prePressOffset.x)),\(Int(prePressOffset.y))) prePressSamples=\(completed.prePressMotion.count) pressGapMs=\(pressGapMs)"
+                "Right gesture direction=\(direction?.rawValue ?? "none", privacy: .public) path=\(decisionPath, privacy: .public) threshold=\(Int(currentThreshold)) start=(\(Int(completed.stroke.start.x)),\(Int(completed.stroke.start.y))) coord=(\(Int(coordinateOffset.x)),\(Int(coordinateOffset.y))) durationMs=\(durationMs) drags=\(completed.dragCount) moves=\(completed.moveCount) remote=\(completed.remoteSource) prePress=(\(Int(prePressOffset.x)),\(Int(prePressOffset.y))) prePressSamples=\(completed.prePressMotion.count) pressGapMs=\(pressGapMs)"
             )
             }
             if let direction {

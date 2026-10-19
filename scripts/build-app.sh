@@ -27,6 +27,10 @@ cp "$PROJECT_DIR/Resources/MouseGesture.icns" "$CONTENTS_DIR/Resources/"
 cp "$PROJECT_DIR/Resources/MenuBarIcon.png" "$CONTENTS_DIR/Resources/"
 cp "$PROJECT_DIR/Resources/MenuBarIcon@2x.png" "$CONTENTS_DIR/Resources/"
 
-CODESIGN_IDENTITY=${MOUSEGESTURE_CODESIGN_IDENTITY:--}
+# A stable identity keeps the Accessibility grant across rebuilds; an ad-hoc
+# signature changes with every build and macOS treats it as a new app.
+DEFAULT_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+    | awk -F'"' '/Apple Development|Developer ID Application/ { print $2; exit }')
+CODESIGN_IDENTITY=${MOUSEGESTURE_CODESIGN_IDENTITY:-${DEFAULT_IDENTITY:--}}
 codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_DIR"
 printf 'Built %s\n' "$APP_DIR"

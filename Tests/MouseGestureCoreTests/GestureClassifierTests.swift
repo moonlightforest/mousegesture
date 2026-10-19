@@ -1,50 +1,64 @@
 import CoreGraphics
+import Foundation
 import Testing
 
 @testable import MouseGestureCore
 
 @Suite
 struct GestureClassifierTests {
-    private let classifier = GestureClassifier(threshold: 40)
+    private let classifier = GestureClassifier(threshold: 8)
+
+    private func point(degrees: CGFloat, length: CGFloat = 50) -> CGPoint {
+        let radians = degrees * .pi / 180
+        return CGPoint(x: length * cos(radians), y: length * sin(radians))
+    }
 
     @Test
     func testMovementBelowThresholdIsClick() {
-        #expect(classifier.direction(from: .zero, to: CGPoint(x: 20, y: 20)) == nil)
-        #expect(classifier.direction(from: .zero, to: CGPoint(x: 39, y: 0)) == nil)
+        #expect(classifier.direction(from: .zero, to: CGPoint(x: 0, y: -7)) == nil)
+        #expect(classifier.direction(from: .zero, to: CGPoint(x: 5, y: 5)) == nil)
+        #expect(GestureClassifier(threshold: 40).direction(from: .zero, to: CGPoint(x: 39, y: 0)) == nil)
     }
 
     @Test
-    func testNarrowPasteAndSingleShortCopy() {
-        let classifier = GestureClassifier(threshold: 8)
-        #expect(classifier.direction(from: .zero, to: CGPoint(x: 3, y: 10)) == .down)
-        #expect(classifier.direction(from: .zero, to: CGPoint(x: -4, y: 10)) == nil)
-        #expect(classifier.direction(from: .zero, to: CGPoint(x: 4, y: 10)) == .right)
-        var copy = ShortVerticalStroke(start: .zero)
-        copy.recordDrag(CGPoint(x: 0, y: -2))
-        #expect(copy.direction(threshold: 8) == nil)
-        copy.recordDrag(CGPoint(x: 1, y: -3))
-        #expect(copy.direction(threshold: 8) == .up)
-        var single = ShortVerticalStroke(start: .zero)
-        single.recordDrag(CGPoint(x: 0, y: -3))
-        #expect(single.direction(threshold: 8) == .up)
-        var slantedPaste = ShortVerticalStroke(start: .zero)
-        slantedPaste.recordDrag(CGPoint(x: 1, y: 2))
-        slantedPaste.recordDrag(CGPoint(x: 2, y: 5))
-        #expect(slantedPaste.direction(threshold: 8) == nil)
+    func testFourDirectionsShareOneDistance() {
+        #expect(classifier.direction(from: .zero, to: CGPoint(x: 0, y: -8)) == .up)
+        #expect(classifier.direction(from: .zero, to: CGPoint(x: 0, y: 8)) == .down)
+        #expect(classifier.direction(from: .zero, to: CGPoint(x: -8, y: 0)) == .left)
+        #expect(classifier.direction(from: .zero, to: CGPoint(x: 8, y: 0)) == .right)
     }
 
     @Test
-    func testFourDirections() {
-        #expect(classifier.direction(from: .zero, to: CGPoint(x: 0, y: -50)) == .up)
-        #expect(classifier.direction(from: .zero, to: CGPoint(x: 0, y: 50)) == .down)
-        #expect(classifier.direction(from: .zero, to: CGPoint(x: -50, y: 0)) == .left)
-        #expect(classifier.direction(from: .zero, to: CGPoint(x: 50, y: 0)) == .right)
+    func testEverySectorIsFortyDegreesEitherSide() {
+        // Screen y grows downward: 0° right, 90° down, 180° left, 270° up.
+        for (axis, expected) in [(0.0, GestureDirection.right), (90, .down), (180, .left), (270, .up)] {
+            for offset in [-39.5, -20, 0, 20, 39.5] {
+                #expect(classifier.direction(from: .zero, to: point(degrees: axis + offset)) == expected)
+            }
+        }
     }
 
     @Test
-    func testDiagonalMovementUsesDominantAxis() {
-        #expect(classifier.direction(from: .zero, to: CGPoint(x: 60, y: -45)) == .right)
-        #expect(classifier.direction(from: .zero, to: CGPoint(x: -45, y: 60)) == nil)
+    func testDiagonalsBetweenSectorsAreNotGestures() {
+        for diagonal in [45.0, 135, 225, 315] {
+            for offset in [-4.0, 0, 4] {
+                #expect(classifier.direction(from: .zero, to: point(degrees: diagonal + offset)) == nil)
+            }
+        }
+    }
+
+    @Test
+    func testRecordedNativeStrokesKeepTheirDirection() {
+        // Real Deskflow strokes after the Windows gesture tool was disabled.
+        for (offset, expected) in [
+            (CGPoint(x: -2, y: -81), GestureDirection.up), (CGPoint(x: 8, y: -72), .up),
+            (CGPoint(x: -3, y: -22), .up), (CGPoint(x: 2, y: -30), .up),
+            (CGPoint(x: -17, y: 86), .down), (CGPoint(x: -15, y: 69), .down),
+            (CGPoint(x: 0, y: 28), .down), (CGPoint(x: 18, y: 81), .down),
+            (CGPoint(x: 149, y: 6), .right), (CGPoint(x: 144, y: 23), .right)
+        ] {
+            #expect(classifier.direction(from: .zero, to: offset) == expected)
+        }
     }
 
     @Test
@@ -63,117 +77,52 @@ struct GestureClassifierTests {
     @Test
     func testShortMovementRemainsRightClick() {
         var stroke = GestureStroke(start: .zero)
-        stroke.record(CGPoint(x: 0, y: -20))
+        stroke.record(CGPoint(x: 0, y: -5))
         stroke.record(.zero)
-        #expect(stroke.direction(threshold: 21) == nil)
+        #expect(stroke.direction(threshold: 8) == nil)
     }
+}
 
+@Suite
+struct ReplayedInputMonitorTests {
     @Test
-    func testTwoShortVerticalDragsTriggerBeforeOrdinaryThreshold() {
-        var downward = ShortVerticalStroke(start: .zero)
-        downward.recordDrag(CGPoint(x: 0, y: 2))
-        #expect(downward.direction(threshold: 8) == nil)
-        downward.recordDrag(CGPoint(x: 1, y: 5))
-        #expect(downward.direction(threshold: 8) == .down)
-
-        var upward = ShortVerticalStroke(start: .zero)
-        upward.recordDrag(CGPoint(x: -1, y: -2))
-        upward.recordDrag(CGPoint(x: -1, y: -6))
-        #expect(upward.direction(threshold: 8) == .up)
-    }
-
-    @Test
-    func testShortVerticalRuleRejectsJitterAndSidewaysMotion() {
-        var singleMove = ShortVerticalStroke(start: .zero)
-        singleMove.recordDrag(CGPoint(x: 0, y: 7))
-        #expect(singleMove.direction(threshold: 8) == nil)
-
-        var reversal = ShortVerticalStroke(start: .zero)
-        reversal.recordDrag(CGPoint(x: 0, y: 3))
-        reversal.recordDrag(CGPoint(x: 0, y: 1))
-        #expect(reversal.direction(threshold: 8) == nil)
-
-        var sideways = ShortVerticalStroke(start: .zero)
-        sideways.recordDrag(CGPoint(x: 4, y: 2))
-        sideways.recordDrag(CGPoint(x: 8, y: 4))
-        #expect(sideways.direction(threshold: 8) == nil)
-
-        var tooShort = ShortVerticalStroke(start: .zero)
-        tooShort.recordDrag(CGPoint(x: 0, y: 2))
-        tooShort.recordDrag(CGPoint(x: 0, y: 4))
-        #expect(tooShort.direction(threshold: 8) == nil)
-
-        var laterRightwardMotion = ShortVerticalStroke(start: .zero)
-        laterRightwardMotion.recordDrag(CGPoint(x: 0, y: 2))
-        laterRightwardMotion.recordDrag(CGPoint(x: 0, y: 6))
-        laterRightwardMotion.recordDrag(CGPoint(x: 6, y: 6))
-        #expect(laterRightwardMotion.direction(threshold: 8) == nil)
-    }
-
-    @Test
-    func testInitialRightDirectionSurvivesModerateLaterVerticalDrift() {
-        var stroke = GestureStroke(start: .zero)
-        stroke.record(CGPoint(x: 20, y: 1))
-        stroke.record(CGPoint(x: 0, y: 30))
-        #expect(stroke.direction(threshold: 8) == .down)
-        #expect(stroke.axisPeakDisplacement == CGPoint(x: 20, y: 30))
-        #expect(stroke.direction(threshold: 8, preferring: .right) == .right)
-
-        stroke.record(CGPoint(x: 0, y: 45))
-        #expect(stroke.direction(threshold: 8, preferring: .right) == .down)
-    }
-
-    @Test
-    func testPostReleaseRecoveryNeedsClearRightMotion() {
-        #expect(!PostReleaseRightSwipe.isRecognized(
-            axisPeak: .zero, moveCount: 0, ordinaryThreshold: 8
-        ))
-        #expect(!PostReleaseRightSwipe.isRecognized(
-            axisPeak: CGPoint(x: 15, y: 0), moveCount: 1, ordinaryThreshold: 8
-        ))
-        #expect(PostReleaseRightSwipe.isRecognized(
-            axisPeak: CGPoint(x: 18, y: 5), moveCount: 2, ordinaryThreshold: 8
-        ))
-        #expect(PostReleaseRightSwipe.isRecognized(
-            axisPeak: CGPoint(x: 18, y: 14), moveCount: 2, ordinaryThreshold: 8
-        ))
-        #expect(!PostReleaseRightSwipe.isRecognized(
-            axisPeak: CGPoint(x: 0, y: 35), moveCount: 3, ordinaryThreshold: 8
-        ))
-    }
-
-    @Test
-    func testDiagonalRightSwipeUsesSameRuleForFastAndOrdinaryInput() {
-        let classifier = GestureClassifier(threshold: 8)
-        for dy in [-12.0, -8.0, 8.0, 12.0] {
-            let offset = CGPoint(x: 8, y: dy)
-            #expect(classifier.direction(from: .zero, to: offset) == .right)
-            #expect(PostReleaseRightSwipe.isRecognized(
-                axisPeak: offset, moveCount: 2, ordinaryThreshold: 8
-            ))
+    func nativeMouseNeverWarns() {
+        var monitor = ReplayedInputMonitor()
+        for second in 0..<10 {
+            #expect(monitor.record(hold: 0, remoteSource: false, at: TimeInterval(second)) == nil)
         }
-        #expect(classifier.direction(from: .zero, to: CGPoint(x: 8, y: 13)) == .right)
-        #expect(classifier.direction(from: .zero, to: CGPoint(x: 8, y: -13)) == .up)
-        #expect(PostReleaseRightSwipe.isRecognized(
-            axisPeak: CGPoint(x: 8, y: 13), moveCount: 2, ordinaryThreshold: 8
-        ))
-        #expect(!PostReleaseRightSwipe.isRecognized(
-            axisPeak: CGPoint(x: 4, y: 3), moveCount: 2, ordinaryThreshold: 8
-        ))
     }
 
     @Test
-    func testRightDownAndPasteSectorsMeetWithoutGap() {
-        let classifier = GestureClassifier(threshold: 8)
-        for degrees in [57.0, 60.0, 66.0, 69.9, 70.1, 75.0, 90.0] {
-            let radians = degrees * .pi / 180
-            let point = CGPoint(x: 20 * cos(radians), y: 20 * sin(radians))
-            let expected: GestureDirection = degrees < 70 ? .right : .down
-            #expect(classifier.direction(from: .zero, to: point) == expected)
-            #expect(PostReleaseRightSwipe.isRecognized(
-                axisPeak: point, moveCount: 2, ordinaryThreshold: 8
-            ) == (expected == .right))
-        }
-        #expect(classifier.direction(from: .zero, to: CGPoint(x: 8, y: -13)) == .up)
+    func threeReplaysWarnAndARealPressClears() {
+        var monitor = ReplayedInputMonitor()
+        #expect(monitor.record(hold: 0.015, remoteSource: true, at: 1) == nil)
+        #expect(monitor.record(hold: 0, remoteSource: true, at: 2) == nil)
+        #expect(monitor.record(hold: 0.02, remoteSource: true, at: 3) == .warn(notify: true))
+        #expect(monitor.record(hold: 0.01, remoteSource: true, at: 4) == nil)
+        #expect(monitor.record(hold: 0.12, remoteSource: true, at: 5) == .clear)
+        #expect(!monitor.isWarning)
+    }
+
+    @Test
+    func spreadOutReplaysAndRealPressesDoNotWarn() {
+        var monitor = ReplayedInputMonitor()
+        #expect(monitor.record(hold: 0, remoteSource: true, at: 0) == nil)
+        #expect(monitor.record(hold: 0, remoteSource: true, at: 100) == nil)
+        #expect(monitor.record(hold: 0, remoteSource: true, at: 300) == nil)
+        #expect(monitor.record(hold: 0.1, remoteSource: true, at: 301) == nil)
+        #expect(monitor.record(hold: 0, remoteSource: true, at: 302) == nil)
+    }
+
+    @Test
+    func repeatedWarningsNotifyAtMostEveryHalfHour() {
+        var monitor = ReplayedInputMonitor()
+        for time in [1.0, 2, 3] { _ = monitor.record(hold: 0, remoteSource: true, at: time) }
+        _ = monitor.record(hold: 0.1, remoteSource: true, at: 4)
+        for time in [5.0, 6] { _ = monitor.record(hold: 0, remoteSource: true, at: time) }
+        #expect(monitor.record(hold: 0, remoteSource: true, at: 7) == .warn(notify: false))
+        _ = monitor.record(hold: 0.1, remoteSource: true, at: 8)
+        for time in [2_000.0, 2_001] { _ = monitor.record(hold: 0, remoteSource: true, at: time) }
+        #expect(monitor.record(hold: 0, remoteSource: true, at: 2_002) == .warn(notify: true))
     }
 }

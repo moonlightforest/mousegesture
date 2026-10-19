@@ -29,34 +29,29 @@ public enum GestureDirection: String, CaseIterable, Codable, Hashable, Identifia
 }
 
 public struct GestureClassifier: Sendable {
+    /// Each direction accepts this many degrees either side of its axis,
+    /// leaving a 10 degree gap on both sides of every diagonal. Recorded
+    /// strokes stay within 13 degrees of their axis.
+    public static let sectorHalfAngle: CGFloat = 40
+
     public var threshold: CGFloat
 
     public init(threshold: CGFloat) {
         self.threshold = max(1, threshold)
     }
 
-    /// Classifies displacement by its dominant axis, with a wider rightward
-    /// sector for window switching (56 degrees upward, 70 degrees downward).
+    /// The same distance and angle rule for all four directions; a diagonal
+    /// between two sectors is not a gesture.
     public func direction(from start: CGPoint, to end: CGPoint) -> GestureDirection? {
         let dx = end.x - start.x
         let dy = end.y - start.y
-
         guard hypot(dx, dy) >= threshold else { return nil }
 
-        // Rightward window switching accepts moderate diagonal drift. Keep
-        // predominantly vertical strokes available for copy and paste.
-        if dx > 0 {
-            if dy >= 0, !Self.isWithinDownSector(dx: dx, dy: dy) { return .right }
-            if dy < 0, dx * 1.5 >= abs(dy) { return .right }
-        }
-
-        if abs(dx) > abs(dy) {
-            return dx > 0 ? .right : .left
-        }
-        return dy > 0 ? (Self.isWithinDownSector(dx: dx, dy: dy) ? .down : nil) : .up
-    }
-    public static func isWithinDownSector(dx: CGFloat, dy: CGFloat) -> Bool {
-        dy > 0 && abs(dx) <= dy * tan(20 * .pi / 180)
+        let horizontal = abs(dx) >= abs(dy)
+        let offAxis = atan2(horizontal ? abs(dy) : abs(dx), horizontal ? abs(dx) : abs(dy)) * 180 / .pi
+        guard offAxis <= Self.sectorHalfAngle else { return nil }
+        if horizontal { return dx > 0 ? .right : .left }
+        return dy > 0 ? .down : .up
     }
 }
 
@@ -99,85 +94,5 @@ public struct GestureStroke: Sendable {
 
     public func direction(threshold: CGFloat) -> GestureDirection? {
         GestureClassifier(threshold: threshold).direction(from: start, to: furthest)
-    }
-
-    /// Keep an early, clearly established axis when later drift only slightly
-    /// exceeds it. A movement more than twice as large on the other axis can
-    /// still correct an accidental initial direction.
-    public func direction(threshold: CGFloat, preferring first: GestureDirection?) -> GestureDirection? {
-        let ordinary = direction(threshold: threshold)
-        guard let first, ordinary != nil else { return ordinary }
-        let peak = axisPeakDisplacement
-        switch first {
-        case .left, .right:
-            let sameSign = first == .right ? peak.x > 0 : peak.x < 0
-            return sameSign && abs(peak.x) >= threshold && abs(peak.y) <= 2 * abs(peak.x)
-                ? first : ordinary
-        case .down:
-            return ordinary
-        case .up:
-            let sameSign = first == .down ? peak.y > 0 : peak.y < 0
-            return sameSign && abs(peak.y) >= threshold && abs(peak.x) <= 2 * abs(peak.y)
-                ? first : ordinary
-        }
-    }
-}
-
-/// Allows a deliberately short vertical drag without making a single noisy
-/// mouse movement count as a gesture. The ordinary classifier still takes
-/// precedence when the configured threshold is reached.
-public struct ShortVerticalStroke: Sendable {
-    private let start: CGPoint
-    private var previous: CGPoint
-    private var streakDirection: GestureDirection?
-    private var streakCount = 0
-    private var candidateOffset = CGPoint.zero
-    private var maximumHorizontalDistance: CGFloat = 0
-
-    public init(start: CGPoint) {
-        self.start = start
-        self.previous = start
-    }
-
-    public static func minimumDistance(for threshold: CGFloat) -> CGFloat {
-        min(max(5, threshold - 3), max(1, threshold))
-    }
-
-    public static func minimumUpDistance(for threshold: CGFloat) -> CGFloat {
-        min(3, max(1, threshold))
-    }
-
-    public mutating func recordDrag(_ point: CGPoint) {
-        let dx = point.x - previous.x
-        let dy = point.y - previous.y
-        previous = point
-        let offset = CGPoint(x: point.x - start.x, y: point.y - start.y)
-        maximumHorizontalDistance = max(maximumHorizontalDistance, abs(offset.x))
-
-        guard abs(dy) >= 1, abs(dy) >= abs(dx) else {
-            streakDirection = nil
-            streakCount = 0
-            return
-        }
-
-        let direction: GestureDirection = dy < 0 ? .up : .down
-        streakCount = direction == streakDirection ? streakCount + 1 : 1
-        streakDirection = direction
-
-        guard (direction == .up || streakCount >= 2), abs(offset.y) >= abs(offset.x),
-              abs(offset.y) > abs(candidateOffset.y)
-        else { return }
-        candidateOffset = offset
-    }
-
-    public func direction(threshold: CGFloat) -> GestureDirection? {
-        let minimum = candidateOffset.y < 0 ? Self.minimumUpDistance(for: threshold) : Self.minimumDistance(for: threshold)
-        guard abs(candidateOffset.y) >= minimum,
-              abs(candidateOffset.y) >= 1.5 * maximumHorizontalDistance
-        else { return nil }
-        if candidateOffset.y > 0, !GestureClassifier.isWithinDownSector(
-            dx: maximumHorizontalDistance, dy: candidateOffset.y
-        ) { return nil }
-        return candidateOffset.y < 0 ? .up : .down
     }
 }

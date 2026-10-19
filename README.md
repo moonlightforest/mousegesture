@@ -15,7 +15,7 @@
 | ← 左滑 | 切换手势起点下窗口的置顶/取消置顶 |
 | → 右滑 | 激活手势起点窗口后一层的窗口 |
 
-每个方向都可以在 `手势设置…` 中单独改为：复制、粘贴、窗口切换、⌘Tab、区域/全屏截图、启动指定 App 或自定义键盘快捷键。默认移动阈值为 40 px，可在 20～100 px 之间调整。
+每个方向都可以在 `手势设置…` 中单独改为：复制、粘贴、窗口切换、⌘Tab、区域/全屏截图、启动指定 App 或自定义键盘快捷键。默认移动阈值为 40 pt，可在 8～100 pt 之间调整；四个方向使用同一阈值，各自接受偏离方向左右 40° 以内的移动，斜向夹在两个方向之间时不触发。
 
 ## 系统要求
 
@@ -34,13 +34,13 @@ make app
 open dist/MouseGesture.app
 ```
 
-`make app` 会生成 `dist/MouseGesture.app` 并进行 ad-hoc 签名。首次运行后，在“系统设置 → 隐私与安全性 → 辅助功能”中启用 MouseGesture。若重新构建导致权限记录失效，删除旧权限条目后重新添加生成的 App。
-
-若本机已有稳定的 Apple Development 或 Developer ID 签名身份，建议在开发构建时指定它，避免每次 ad-hoc 重签名后重新授予辅助功能和屏幕录制权限：
+`make app` 会生成 `dist/MouseGesture.app`。脚本会自动使用钥匙串里第一个 Apple Development 或 Developer ID 签名身份；没有时才退回 ad-hoc 签名。固定身份签名后，重新构建不会让辅助功能和屏幕录制权限失效；ad-hoc 签名每次构建都会变，需要重新授权。也可以手动指定：
 
 ```bash
 MOUSEGESTURE_CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)" make app
 ```
+
+首次运行后，在“系统设置 → 隐私与安全性 → 辅助功能”中启用 MouseGesture。
 
 启用 MouseGesture 前，请在 BetterTouchTool 中停用原来的右键拖动触发器，避免两个事件监听器互相竞争。
 

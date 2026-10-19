@@ -4,6 +4,7 @@ import MouseGestureCore
 import OSLog
 import ServiceManagement
 import SwiftUI
+import UserNotifications
 
 private let appLogger = Logger(subsystem: "com.yaoyinliang.MouseGesture", category: "Application")
 
@@ -15,6 +16,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var listenerStatus: InputListenerStatus = .paused
     private var listenerStatusItem: NSMenuItem?
     private var recoverItem: NSMenuItem?
+    private var replayWarningItem: NSMenuItem?
+    private var replayWarning = false
     var settingsContent: SettingsView { SettingsView(store: store) }
     private var statusItem: NSStatusItem?
     private var settingsWindow: NSWindow?
@@ -38,6 +41,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.listenerStatus = status
             if case .faulted = status { self.executor.cancelPendingShortcut() }
             self.refreshMenuState()
+        }, replayHandler: { [weak self] change in
+            self?.handleReplayedInput(change)
         })
 
     private func updateForegroundSnapshot() {
@@ -48,7 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        appLogger.notice("Gesture input revision 16: pre-press recovery only for replayed strokes")
+        appLogger.notice("Gesture input revision 17: uniform sectors, stable signing, replay warning")
         appLogger.notice(
             "Permissions accessibility=\(AccessibilityPermission.isGranted) screenRecording=\(ScreenRecordingPermission.isGranted)"
         )
@@ -111,6 +116,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recover.target = self
         menu.addItem(recover)
         recoverItem = recover
+        let replay = NSMenuItem(title: "⚠️ Windows 端手势软件可能仍在拦截右键", action: nil, keyEquivalent: "")
+        replay.isEnabled = false
+        replay.isHidden = true
+        menu.addItem(replay)
+        replayWarningItem = replay
 
         let enabled = NSMenuItem(title: "已启用", action: #selector(toggleEnabled), keyEquivalent: "")
         enabled.target = self
@@ -192,10 +202,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         listenerStatusItem?.title = message
         statusItem?.button?.toolTip = "MouseGesture · " + message
         recoverItem?.isHidden = listenerStatus != .faulted
+        replayWarningItem?.isHidden = !replayWarning
         enabledItem?.state = listenerStatus == .running ? .on : .off
         permissionItem?.state = AccessibilityPermission.isGranted ? .on : .off
         screenRecordingItem?.state = ScreenRecordingPermission.isGranted ? .on : .off
         launchAtLoginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    }
+
+    /// Short swipes become unreliable while the Windows gesture tool replays
+    /// right presses; say so instead of degrading silently.
+    private func handleReplayedInput(_ change: ReplayedInputMonitor.Change) {
+        switch change {
+        case .warn(let notify):
+            replayWarning = true
+            appLogger.notice("Replayed right presses from remote input; Windows gesture tool may be active")
+            if notify { postReplayNotification() }
+        case .clear:
+            replayWarning = false
+            appLogger.notice("Remote right presses arrive in real time again")
+        }
+        refreshMenuState()
+    }
+
+    private func postReplayNotification() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { granted, _ in
+            guard granted else { return }
+            let content = UNMutableNotificationContent()
+            content.title = "鼠标手势：右键被 Windows 端拦截"
+            content.body = "通过 Deskflow 收到的右键是松开后补发的，短滑可能不准。请检查 Windows 端是否已关闭 StrokesPlus.net。"
+            UNUserNotificationCenter.current().add(
+                UNNotificationRequest(identifier: "replayed-right-presses", content: content, trigger: nil))
+        }
     }
 
     @objc private func recoverListener() {

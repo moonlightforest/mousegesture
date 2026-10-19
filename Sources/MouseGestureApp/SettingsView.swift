@@ -27,7 +27,7 @@ struct SettingsView: View {
                     .frame(width: 52, alignment: .trailing)
             }
 
-            Text("按住右键移动达到阈值并释放后执行动作；上滑复制最短 3 pt；下滑限垂直左右各 20°，连续两段同向短下滑可在 \(Int(ShortVerticalStroke.minimumDistance(for: CGFloat(store.configuration.threshold)))) pt 触发。")
+            Text("按住右键移动达到阈值并释放后执行动作。四个方向使用相同的阈值，各自接受偏离方向左右 \(Int(GestureClassifier.sectorHalfAngle))° 以内的移动；斜向夹在两个方向之间时不触发。")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }

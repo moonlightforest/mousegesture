@@ -231,6 +231,7 @@ private final class WindowController: NSObject {
     private var recentWindows: [WindowInfo] = []
     private var switchPair: [WindowInfo] = []
     private var lastSwitchTargetID: CGWindowID?
+    private var stageManagerThumbnailBounds: [CGRect] = []
     private var workspaceObserver: NSObjectProtocol?
     private var accessibilityObserver: AXObserver?
     private var observedApplicationElement: AXUIElement?
@@ -473,7 +474,13 @@ private final class WindowController: NSObject {
             let raw = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]]
         else { return [] }
-        return raw.compactMap(windowInfo(from:))
+        let windows = raw.compactMap(windowInfo(from:))
+        let windowManagerPIDs = Set(NSRunningApplication
+            .runningApplications(withBundleIdentifier: "com.apple.WindowManager").map(\.processIdentifier))
+        stageManagerThumbnailBounds = windows
+            .filter { windowManagerPIDs.contains($0.ownerPID) && $0.isOnScreen }
+            .map(\.bounds)
+        return windows
     }
 
     private func windowInfo(from dictionary: [String: Any]) -> WindowInfo? {
@@ -504,9 +511,10 @@ private final class WindowController: NSObject {
         return info.layer == 0 && info.alpha > 0 && info.bounds.width >= 120 && info.bounds.height >= 80
     }
 
+    // Stage Manager draws each strip thumbnail as the app's own window with a
+    // WindowManager window of the same bounds over it, wherever the stack sits.
     private func isStageManagerThumbnail(_ info: WindowInfo) -> Bool {
-        info.isOnScreen && info.bounds.minX <= 50
-            && info.bounds.width < 200 && info.bounds.height < 200
+        info.isOnScreen && stageManagerThumbnailBounds.contains(info.bounds)
     }
 
     private func matchScore(_ info: WindowInfo, title: String, frame: CGRect?) -> CGFloat {
